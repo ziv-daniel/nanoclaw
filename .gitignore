@@ -39,3 +39,6 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# ops layer secrets
+ops/.env
