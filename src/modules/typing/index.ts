@@ -43,6 +43,15 @@ const HEARTBEAT_FRESH_MS = 6000;
  * stays running; ticks inside the pause just skip the setTyping call.
  */
 const POST_DELIVERY_PAUSE_MS = 10000;
+/**
+ * Hard wall-clock cap on a single typing-refresh lifetime. The
+ * existing heartbeat-based stop is the primary signal, but if an
+ * agent is stuck "alive" (heartbeat fresh, no delivery ever) typing
+ * would otherwise refresh forever. 10 min is well above legitimate
+ * long-thinking turns and tight enough that a runaway is visibly
+ * bounded.
+ */
+const TYPING_MAX_DURATION_MS = parseInt(process.env.NANOCLAW_TYPING_MAX_MS || '', 10) || 10 * 60 * 1000;
 
 interface TypingAdapter {
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
@@ -121,6 +130,14 @@ export function startTypingRefresh(
     // interval running so we resume automatically once the pause
     // expires.
     if (entry.pausedUntil > Date.now()) return;
+
+    // Hard wall-clock cap: even if heartbeat keeps refreshing,
+    // never let a single typing session run past the cap.
+    if (Date.now() - entry.startedAt > TYPING_MAX_DURATION_MS) {
+      clearInterval(entry.interval);
+      typingRefreshers.delete(sessionId);
+      return;
+    }
 
     const withinGrace = Date.now() - entry.startedAt < TYPING_GRACE_MS;
     if (withinGrace || isHeartbeatFresh(entry.agentGroupId, sessionId)) {

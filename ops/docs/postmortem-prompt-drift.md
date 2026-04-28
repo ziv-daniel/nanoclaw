@@ -33,9 +33,14 @@ The main Telegram channel agent ("Andy", agent group `ag-1777150999662-ryx8n1`) 
 
 ## Still open
 
-- **Auto-rotate sessions** before they grow huge. Today's reset is manual surgery; the right fix is for agent-runner to compact + start a new session at e.g. 1000 turns or 5 MB JSONL. Without it, the new clean session will eventually drift the same way over months.
-- **Detect format drift symptoms.** When the orchestrator sees N consecutive `WARNING: agent output had no <message to=…> blocks` for a session, that's a clear signal to recycle the SDK session. Currently the warning is logged but not actioned.
-- **Typing-indicator never stops.** Reported by user same session. Separate diagnosis pending.
+### Shipped 2026-04-29
+
+- **Auto-rotate sessions** — [`ops/patches/2026-04-29-auto-rotate-session.py`](../patches/2026-04-29-auto-rotate-session.py). Agent-runner now checks the transcript JSONL at poll-loop startup and every 50 polls; if it exceeds 5 MB or 1500 turns, the stored session id is cleared and the next provider call starts fresh. Defaults tuneable via `NANOCLAW_MAX_SESSION_BYTES` / `NANOCLAW_MAX_SESSION_TURNS`. The durable counterpart to today's manual reset.
+- **Typing-indicator wall-clock cap** — [`ops/patches/2026-04-29-typing-max-duration.py`](../patches/2026-04-29-typing-max-duration.py). `src/modules/typing/index.ts` now hard-stops a refresher after `NANOCLAW_TYPING_MAX_MS` (default 10 min), so even if heartbeat stays fresh and host-sweep doesn't intervene, the UI typing indicator can't run forever.
+
+### Still open
+
+- **Detect format drift symptoms.** When the orchestrator sees N consecutive `WARNING: agent output had no <message to=…> blocks` for a session, that's a clear signal to recycle the SDK session. Currently the warning is logged but not actioned. With auto-rotate in place this is lower priority but still a useful early-warning signal.
 
 ## Lessons
 

@@ -3,6 +3,51 @@ import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } 
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
+import fs from 'fs';
+import path from 'path';
+
+// Auto-rotate the Claude SDK session before its transcript grows past
+// the size where prompt-format drift becomes likely. Empirically a
+// 9.7 MB / 2,915-turn JSONL was severe enough that every container
+// resuming the session learned a broken response format from history.
+// Defaults: 5 MB OR 1500 turns. Tuneable via env.
+const MAX_SESSION_BYTES = parseInt(process.env.NANOCLAW_MAX_SESSION_BYTES || '', 10) || 5 * 1024 * 1024;
+const MAX_SESSION_TURNS = parseInt(process.env.NANOCLAW_MAX_SESSION_TURNS || '', 10) || 1500;
+
+function transcriptPath(continuation: string): string | null {
+  const home = process.env.HOME;
+  if (!home) return null;
+  // Claude SDK encodes the cwd into the projects dir slug: each `/`
+  // becomes `-`, leading `/` stays as a leading `-`. For a runner
+  // working in /workspace/agent that produces `-workspace-agent`.
+  const cwd = process.cwd();
+  const slug = cwd.replace(/\//g, '-');
+  return path.join(home, '.claude', 'projects', slug, `${continuation}.jsonl`);
+}
+
+/** Returns true if the caller should clear `continuation` and start fresh. */
+function maybeRotateSession(continuation: string | undefined, log: (msg: string) => void): boolean {
+  if (!continuation) return false;
+  const tp = transcriptPath(continuation);
+  if (!tp) return false;
+  let size = 0;
+  let turns = 0;
+  try {
+    size = fs.statSync(tp).size;
+    if (size <= MAX_SESSION_BYTES / 2) return false; // fast path: small file, no need to count lines
+    // Count newlines lazily — only when we're already over half the byte budget.
+    const buf = fs.readFileSync(tp);
+    turns = 0;
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) turns++;
+  } catch {
+    return false;
+  }
+  if (size > MAX_SESSION_BYTES || turns > MAX_SESSION_TURNS) {
+    log(`Auto-rotating session ${continuation}: ${size} bytes / ${turns} turns exceeds cap (${MAX_SESSION_BYTES} bytes / ${MAX_SESSION_TURNS} turns)`);
+    return true;
+  }
+  return false;
+}
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -44,6 +89,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
+    if (maybeRotateSession(continuation, log)) {
+      continuation = undefined;
+      clearStoredSessionId();
+      log('Cleared stored session ID — next query will start a fresh Claude session.');
+    }
   }
 
   // Clear leftover 'processing' acks from a previous crashed container.
@@ -59,6 +109,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Periodic heartbeat so we know the loop is alive
     if (pollCount % 30 === 0) {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
+    }
+
+    // Periodic rotation check: if the active session has grown past
+    // the size cap mid-run, clear it so the next query starts fresh.
+    // Skipped while a query is active (would interrupt mid-turn).
+    if (pollCount % 50 === 0 && messages.length === 0 && maybeRotateSession(continuation, log)) {
+      continuation = undefined;
+      clearStoredSessionId();
+      log('Cleared stored session ID mid-run — next query will start a fresh Claude session.');
     }
 
     if (messages.length === 0) {
@@ -275,6 +334,12 @@ async function processQuery(
     }
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // Wall-clock heartbeat: touch every 5s independent of SDK events so long
+  // tool calls (MCP, OneCLI gateway, hung WebFetch) don't trigger the
+  // host-side claim-stuck/ceiling kill. The per-event touchHeartbeat below
+  // stays as a fast-path; this timer is the safety net.
+  const wallHbHandle = setInterval(() => touchHeartbeat(), 5000);
+  (wallHbHandle as { unref?: () => void }).unref?.();
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -305,6 +370,7 @@ async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    clearInterval(wallHbHandle);
   }
 
   return { continuation: queryContinuation };
