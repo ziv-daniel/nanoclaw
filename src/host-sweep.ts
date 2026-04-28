@@ -43,24 +43,29 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { isContainerRunning, killContainer, wakeContainer, getContainerStartedAt } from './container-runner.js';
 import type { Session } from './types.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
-export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
+export const ABSOLUTE_CEILING_MS = parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
+// Wall-clock max-lifetime for any running container, regardless of
+// heartbeat or activity. Prevents long-lived containers from drifting
+// out of their system prompt / response format. 0 disables the cap.
+export const MAX_LIFETIME_MS = parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
-export const CLAIM_STUCK_MS = 60 * 1000;
+export const CLAIM_STUCK_MS = parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
-  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
+  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number }
+  | { action: 'kill-lifetime'; lifetimeMs: number; capMs: number };
 
 /**
  * Pure decision for whether a running container should be killed this sweep
@@ -72,9 +77,25 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  containerStartedAtMs: number | null;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, containerStartedAtMs } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
+
+  // Wall-clock max-lifetime check. Fires even when the container is
+  // actively working — prevents prompt drift on long-lived containers.
+  // Skipped while a Bash tool with declared timeout is running, so we
+  // don't interrupt user-declared long jobs.
+  if (
+    MAX_LIFETIME_MS > 0 &&
+    containerStartedAtMs !== null &&
+    declaredBashMs === null
+  ) {
+    const lifetime = now - containerStartedAtMs;
+    if (lifetime > MAX_LIFETIME_MS) {
+      return { action: 'kill-lifetime', lifetimeMs: lifetime, capMs: MAX_LIFETIME_MS };
+    }
+  }
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
   // A freshly-spawned container hasn't had any SDK activity yet so no
@@ -222,9 +243,21 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    containerStartedAtMs: getContainerStartedAt(session.id),
   });
 
   if (decision.action === 'ok') return;
+
+  if (decision.action === 'kill-lifetime') {
+    log.warn('Killing container past max lifetime', {
+      sessionId: session.id,
+      lifetimeMs: decision.lifetimeMs,
+      capMs: decision.capMs,
+    });
+    killContainer(session.id, 'max-lifetime');
+    resetStuckProcessingRows(inDb, outDb, session, 'max-lifetime');
+    return;
+  }
 
   if (decision.action === 'kill-ceiling') {
     log.warn('Killing container past absolute ceiling', {

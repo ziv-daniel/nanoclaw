@@ -8,6 +8,10 @@
  * to sensible defaults. Writes are atomic-enough (write-then-rename is not
  * worth the ceremony here since there's only one writer in practice: the
  * host, from the delivery thread that processes approved system actions).
+ *
+ * Global MCP servers: any MCP servers defined in `groups/_global/container.json`
+ * are merged into every group's config automatically. Group-level entries
+ * override global ones when the key matches.
  */
 import fs from 'fs';
 import path from 'path';
@@ -49,6 +53,8 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
 }
 
+const GLOBAL_FOLDER = '_global';
+
 function emptyConfig(): ContainerConfig {
   return {
     mcpServers: {},
@@ -62,19 +68,37 @@ function configPath(folder: string): string {
   return path.join(GROUPS_DIR, folder, 'container.json');
 }
 
+/** Read MCP servers from the global config, silently returning {} on any error. */
+function readGlobalMcpServers(): Record<string, McpServerConfig> {
+  const p = configPath(GLOBAL_FOLDER);
+  if (!fs.existsSync(p)) return {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
+    return raw.mcpServers ?? {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Read the container config for a group, returning sensible defaults for
  * any missing fields (or an entirely empty config if the file is absent).
  * Never throws for missing / malformed files — corruption logs a warning
  * via console.error and falls back to empty.
+ *
+ * Global MCP servers (from _global/container.json) are merged in as the base
+ * layer; group-specific entries override them.
  */
 export function readContainerConfig(folder: string): ContainerConfig {
+  const globalMcpServers = folder !== GLOBAL_FOLDER ? readGlobalMcpServers() : {};
   const p = configPath(folder);
-  if (!fs.existsSync(p)) return emptyConfig();
+  if (!fs.existsSync(p)) {
+    return { ...emptyConfig(), mcpServers: { ...globalMcpServers } };
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
     return {
-      mcpServers: raw.mcpServers ?? {},
+      mcpServers: { ...globalMcpServers, ...(raw.mcpServers ?? {}) },
       packages: {
         apt: raw.packages?.apt ?? [],
         npm: raw.packages?.npm ?? [],
@@ -90,7 +114,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
-    return emptyConfig();
+    return { ...emptyConfig(), mcpServers: { ...globalMcpServers } };
   }
 }
 

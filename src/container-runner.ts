@@ -48,7 +48,12 @@ import type { AgentGroup, Session } from './types.js';
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; startedAt: number }>();
+
+/** Wall-clock time when the container was spawned. Returns null if not running. */
+export function getContainerStartedAt(sessionId: string): number | null {
+  return activeContainers.get(sessionId)?.startedAt ?? null;
+}
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -145,7 +150,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, startedAt: Date.now() });
   markContainerRunning(session.id);
 
   // Log stderr
