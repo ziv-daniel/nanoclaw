@@ -248,6 +248,10 @@ export class ClaudeProvider implements AgentProvider {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
+    // Model + effort are now decided per-message by the routing layer
+    // (see container/agent-runner/src/routing/) and passed via QueryInput.
+    // The constructor no longer pins them — that prevented per-message
+    // switching between Haiku/Sonnet/Opus.
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -265,6 +269,13 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    // Per-call env overlay: routing decides model + effort per message.
+    // We must NOT mutate this.env (concurrent queries would race); build
+    // a fresh dict each call instead.
+    const callEnv: Record<string, string | undefined> = { ...this.env };
+    if (input.model) callEnv.ANTHROPIC_MODEL = input.model;
+    if (input.effort) callEnv.CLAUDE_CODE_REASONING_EFFORT = input.effort;
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -272,10 +283,11 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
+        model: input.model,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: this.env,
+        env: callEnv,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
@@ -304,7 +316,25 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
+          const sdkUsage = (message as {
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_creation_input_tokens?: number;
+              cache_read_input_tokens?: number;
+            };
+            model?: string;
+          }).usage;
+          const usage = sdkUsage
+            ? {
+                model: (message as { model?: string }).model,
+                input_tokens: sdkUsage.input_tokens ?? 0,
+                output_tokens: sdkUsage.output_tokens ?? 0,
+                cache_create_tokens: sdkUsage.cache_creation_input_tokens ?? 0,
+                cache_read_tokens: sdkUsage.cache_read_input_tokens ?? 0,
+              }
+            : undefined;
+          yield { type: 'result', text, usage };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

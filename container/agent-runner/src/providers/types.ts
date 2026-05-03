@@ -47,6 +47,21 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /**
+   * Model id to use for this single query. Comes from the routing layer
+   * (rule-based or Grok) and may differ between consecutive calls in
+   * the same session. If omitted, the provider falls back to its own
+   * default.
+   */
+  model?: string;
+
+  /**
+   * Reasoning effort level for this single query: 'low' | 'medium' |
+   * 'high' | 'xhigh'. Surfaced into the SDK env as
+   * `CLAUDE_CODE_REASONING_EFFORT` so the underlying CLI honors it.
+   */
+  effort?: string;
 }
 
 export interface McpServerConfig {
@@ -69,9 +84,19 @@ export interface AgentQuery {
   abort(): void;
 }
 
+export interface UsageInfo {
+  /** Model identifier the SDK reported for this turn. May differ from
+   * what we asked for (e.g. when the SDK silently downgraded). */
+  model?: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_create_tokens: number;
+  cache_read_tokens: number;
+}
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
-  | { type: 'result'; text: string | null }
+  | { type: 'result'; text: string | null; usage?: UsageInfo }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

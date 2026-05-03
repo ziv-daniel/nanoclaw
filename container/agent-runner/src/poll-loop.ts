@@ -3,6 +3,9 @@ import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } 
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
+import { recordModelDecision } from './db/model-decisions.js';
+import { recordUsage } from './db/agent-usage.js';
+import { getRouter, type RouteDecision } from './routing/index.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -60,6 +63,35 @@ function log(msg: string): void {
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Short label for the user-visible prefix: "opus", "sonnet", "haiku", or the raw id. */
+function shortModelLabel(model: string): string {
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('haiku')) return 'haiku';
+  return model;
+}
+
+/** `_[opus · high]_\n` — italic-rendered in markdown channels (Telegram, Slack). */
+function formatRoutePrefix(decision: RouteDecision): string {
+  return `_[${shortModelLabel(decision.model)} · ${decision.effort}]_\n`;
+}
+
+/** Pull representative text from the batch for routing — joins all message
+ * `text` fields, capped at 2000 chars so a long pasted log doesn't dominate. */
+function extractRouteText(messages: MessageInRow[]): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    try {
+      const c = JSON.parse(m.content) as { text?: string };
+      if (c?.text) parts.push(c.text);
+    } catch {
+      // Non-JSON content (rare) — fall back to raw.
+      parts.push(m.content);
+    }
+  }
+  return parts.join('\n').slice(0, 2000);
 }
 
 export interface PollLoopConfig {
@@ -208,18 +240,47 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    // Route this turn: pick model + effort from the message content.
+    // Decision is per-turn; follow-up messages pushed mid-stream inherit it.
+    const router = getRouter();
+    const routeText = extractRouteText(keep);
+    const decision = await router.route({
+      message: routeText,
+      channelType: routing.channelType,
+    });
+    log(`Route: ${decision.model} · ${decision.effort} (rule=${decision.rule})`);
+    try {
+      recordModelDecision({
+        ts: new Date().toISOString(),
+        message_id: keep[0]?.id ?? null,
+        channel_type: routing.channelType ?? null,
+        model: decision.model,
+        effort: decision.effort,
+        executor: decision.executor,
+        rule: decision.rule,
+        reason: decision.reason ?? null,
+        message_excerpt: routeText.slice(0, 200),
+        decided_by: router.kind,
+      });
+    } catch (e) {
+      // Decision logging is best-effort — never block a query on it.
+      log(`recordModelDecision failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
+      model: decision.model,
+      effort: decision.effort,
     });
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds);
+      const result = await processQuery(query, routing, processingIds, decision);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -237,14 +298,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearStoredSessionId();
       }
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong.
+      // Prefix surfaces which model failed — useful for telling "Sonnet
+      // is exhausted" apart from "auth broken".
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        content: JSON.stringify({ text: `${formatRoutePrefix(decision)}Error: ${errMsg}` }),
       });
     }
 
@@ -297,6 +360,7 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
+  decision: RouteDecision,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -362,8 +426,25 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        // Capture token usage for monitoring (mcp__nanoclaw__get_usage).
+        // Best-effort — never blocks turn completion.
+        if (event.usage) {
+          try {
+            recordUsage({
+              ts: new Date().toISOString(),
+              session_id: queryContinuation ?? null,
+              model: event.usage.model ?? decision.model,
+              input_tokens: event.usage.input_tokens,
+              output_tokens: event.usage.output_tokens,
+              cache_create_tokens: event.usage.cache_create_tokens,
+              cache_read_tokens: event.usage.cache_read_tokens,
+            });
+          } catch (e) {
+            log(`recordUsage failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          dispatchResultText(event.text, routing, decision);
         }
       }
     }
@@ -405,8 +486,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext, decision: RouteDecision): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const prefix = formatRoutePrefix(decision);
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -427,7 +509,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, body, routing);
+    sendToDestination(dest, prefix + body, routing);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -449,13 +531,13 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: scratchpad }),
+        content: JSON.stringify({ text: prefix + scratchpad }),
       });
       return;
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
+      sendToDestination(all[0], prefix + scratchpad, routing);
       return;
     }
   }
