@@ -39,6 +39,11 @@ function log(msg: string): void {
 
 const CWD = '/workspace/agent';
 
+// Sonnet as the default model — avoids falling back to Haiku for sub-tasks.
+// Override per-group via container.json `model` field.
+// Per-turn override: user sends /model <name> (passed through to Claude Code SDK).
+const DEFAULT_MODEL = 'claude-sonnet-4-6';
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
@@ -89,7 +94,10 @@ async function main(): Promise<void> {
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      ANTHROPIC_MODEL: config.model || DEFAULT_MODEL,
+    },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
   });
 
