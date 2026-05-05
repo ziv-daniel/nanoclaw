@@ -47,6 +47,9 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /** Model override for this specific query (e.g. from routing decision). */
+  model?: string;
 }
 
 export interface McpServerConfig {
