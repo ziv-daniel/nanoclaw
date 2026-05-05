@@ -51,6 +51,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         git \
         tini \
         unzip \
+        ffmpeg \
+        python3 \
+        python3-pip \
+        tesseract-ocr \
+        jq \
+        imagemagick \
+        poppler-utils \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
