@@ -9,6 +9,7 @@ import {
 } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { getRouter } from './routing/index.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -160,11 +161,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    const routeCtx = {
+      message: keep.map(m => m.content).join(' ').slice(0, 800),
+      hasAttachment: keep.some(m => /\[(image|voice|document|video|file)\s/i.test(m.content)),
+    };
+    const routeDecision = await getRouter().route(routeCtx);
+    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'})`);
+
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
+      model: routeDecision.model,
     });
 
     // Process the query while concurrently polling for new messages
