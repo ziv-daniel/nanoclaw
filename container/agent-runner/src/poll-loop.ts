@@ -134,6 +134,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  // Startup notification — fires on every fresh container boot so you can
+  // confirm a new deployment went live without sending a test message first.
+  const _startupChannels = getAllDestinations().filter(
+    d => d.type === 'channel' && d.channelType && d.platformId,
+  );
+  for (const dest of _startupChannels) {
+    writeMessageOut({
+      id: generateId(),
+      kind: 'chat',
+      platform_id: dest.platformId!,
+      channel_type: dest.channelType!,
+      thread_id: null,
+      content: JSON.stringify({ text: '🟢 Agent online' }),
+    });
+  }
+  if (_startupChannels.length > 0) log('Startup notification sent');
+
   let pollCount = 0;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
