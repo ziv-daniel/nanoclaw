@@ -366,6 +366,21 @@ async function processQuery(
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
+      } else if (event.type === 'error' && event.classification === 'quota') {
+        // API quota exhausted — notify the user immediately so they know
+        // why the agent has stopped responding.
+        log('API quota exhausted — notifying user');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text: '⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.
+בדוק: https://console.anthropic.com/settings/limits',
+          }),
+        });
       }
     }
   } finally {
