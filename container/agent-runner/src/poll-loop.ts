@@ -8,6 +8,8 @@ import { recordUsage } from './db/agent-usage.js';
 import { getRouter, type RouteDecision } from './routing/index.js';
 import fs from 'fs';
 import path from 'path';
+import { runCaveman } from './memory/caveman.js';
+import { fetchRelevantMemories, storeMemory } from './memory/qdrant-client.js';
 
 // Auto-rotate the Claude SDK session before its transcript grows past
 // the size where prompt-format drift becomes likely. Empirically a
@@ -244,9 +246,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Decision is per-turn; follow-up messages pushed mid-stream inherit it.
     const router = getRouter();
     const routeText = extractRouteText(keep);
+
+    const _cavemanApiKey = process.env.ANTHROPIC_API_KEY ?? '';
+    const [cavemanResult, relevantMemories] = await Promise.all([
+      _cavemanApiKey ? runCaveman(routeText, _cavemanApiKey) : Promise.resolve(null),
+      fetchRelevantMemories(routeText, 5),
+    ]);
+    let enrichedInstructions = config.systemContext?.instructions ?? '';
+    if (cavemanResult) {
+      enrichedInstructions = `[Directive: ${cavemanResult.directive}]\n\n${enrichedInstructions}`;
+      log(`Caveman: ${cavemanResult.taskType}${cavemanResult.hint ? ` — ${cavemanResult.hint}` : ''}`);
+    }
+    if (relevantMemories.length > 0) {
+      const memBlock = relevantMemories.map(m => `- ${m.text}`).join('\n');
+      enrichedInstructions += `\n\n[Relevant context from memory:]\n${memBlock}`;
+    }
+    const enrichedSystemContext = enrichedInstructions
+      ? { ...config.systemContext, instructions: enrichedInstructions }
+      : config.systemContext;
+
     const decision = await router.route({
       message: routeText,
       channelType: routing.channelType,
+      cavemanSummary: cavemanResult
+        ? `${cavemanResult.taskType}${cavemanResult.hint ? `: ${cavemanResult.hint}` : ''}`
+        : undefined,
     });
     log(`Route: ${decision.model} · ${decision.effort} (rule=${decision.rule})`);
     try {
@@ -271,7 +295,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       prompt,
       continuation,
       cwd: config.cwd,
-      systemContext: config.systemContext,
+      systemContext: enrichedSystemContext,
       model: decision.model,
       effort: decision.effort,
     });
@@ -314,6 +338,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
+    storeMemory(routeText, {
+      channel_type: routing.channelType ?? undefined,
+      task_type: cavemanResult?.taskType,
+      model: decision.model,
+    }).catch(() => {});
     log(`Completed ${ids.length} message(s)`);
   }
 }

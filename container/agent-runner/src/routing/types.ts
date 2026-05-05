@@ -32,6 +32,8 @@ export interface RouteContext {
   channel?: string | null;
   /** Used by per-channel overrides (e.g. trading channel → Grok executor). */
   channelType?: string | null;
+  /** Optional Caveman task classification for router hints. */
+  cavemanSummary?: string;
 }
 
 export interface Router {

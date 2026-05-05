@@ -7,6 +7,7 @@
  * provisioned, switching is a single env-var flip.
  */
 import { RuleRouter } from './rule-router.js';
+import { GrokRouter } from './grok-router.js';
 import type { Router } from './types.js';
 
 let _router: Router | null = null;
@@ -18,9 +19,9 @@ export function getRouter(): Router {
     case 'rules':
       _router = new RuleRouter();
       break;
-    // case 'grok':  // Phase 2 — wired once xAI secret narrowed to Host: api.x.ai
-    //   _router = new GrokRouter();
-    //   break;
+    case 'grok':
+      _router = new GrokRouter();
+      break;
     default:
       console.error(`[routing] Unknown NANOCLAW_ROUTER='${kind}', falling back to 'rules'`);
       _router = new RuleRouter();
