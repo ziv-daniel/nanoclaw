@@ -161,6 +161,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    const isTaskOrigin = keep.every(m => m.kind === 'task' || m.kind === 'webhook');
+
     const routeCtx = {
       message: keep.map(m => m.content).join(' ').slice(0, 800),
       hasAttachment: keep.some(m => /\[(image|voice|document|video|file)\s/i.test(m.content)),
@@ -180,7 +182,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -259,6 +261,7 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  isTaskOrigin: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -373,7 +376,7 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          dispatchResultText(event.text, routing, isTaskOrigin);
         }
       } else if (event.type === 'error' && event.classification === 'quota') {
         // API quota exhausted — notify the user immediately so they know
@@ -429,7 +432,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -463,7 +466,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   // Single-destination shortcut: the agent wrote plain text — send to
   // the session's originating channel (from session_routing) if available,
   // otherwise fall back to the single destination.
-  if (sent === 0 && scratchpad) {
+  if (sent === 0 && scratchpad && !isTaskOrigin) {
     if (routing.channelType && routing.platformId) {
       // Reply to the channel/thread the message came from
       writeMessageOut({
