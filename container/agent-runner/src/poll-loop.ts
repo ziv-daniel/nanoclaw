@@ -139,17 +139,28 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const _startupChannels = getAllDestinations().filter(
     d => d.type === 'channel' && d.channelType && d.platformId,
   );
-  for (const dest of _startupChannels) {
-    writeMessageOut({
-      id: generateId(),
-      kind: 'chat',
-      platform_id: dest.platformId!,
-      channel_type: dest.channelType!,
-      thread_id: null,
-      content: JSON.stringify({ text: '🟢 Agent online' }),
-    });
+  if (_startupChannels.length > 0) {
+    // Include recent deploy log if n8n wrote one after the last deploy.
+    let _startupText = '🟢 Agent online';
+    try {
+      const _deployLog = fs.readFileSync(
+        path.join(import.meta.dir, '.deploy-log.txt'), 'utf8',
+      ).trim();
+      if (_deployLog) _startupText += `\n\nWhat changed:\n${_deployLog}`;
+    } catch { /* no deploy log yet — first boot or manual deploy */ }
+
+    for (const dest of _startupChannels) {
+      writeMessageOut({
+        id: generateId(),
+        kind: 'chat',
+        platform_id: dest.platformId!,
+        channel_type: dest.channelType!,
+        thread_id: null,
+        content: JSON.stringify({ text: _startupText }),
+      });
+    }
+    log('Startup notification sent');
   }
-  if (_startupChannels.length > 0) log('Startup notification sent');
 
   let pollCount = 0;
   while (true) {
