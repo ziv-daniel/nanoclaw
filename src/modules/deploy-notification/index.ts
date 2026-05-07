@@ -34,12 +34,14 @@ const DEPLOY_LOG = path.resolve(process.cwd(), 'logs', 'deploy.log');
 
 function gitHeadSha(): string | null {
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: process.cwd(),
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .toString()
-      .trim() || null;
+    return (
+      execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+        .toString()
+        .trim() || null
+    );
   } catch {
     return null;
   }
@@ -47,11 +49,10 @@ function gitHeadSha(): string | null {
 
 function gitLogBetween(fromSha: string, toSha: string): string {
   try {
-    return execFileSync(
-      'git',
-      ['log', '--oneline', '--no-decorate', `${fromSha}..${toSha}`],
-      { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] },
-    )
+    return execFileSync('git', ['log', '--oneline', '--no-decorate', `${fromSha}..${toSha}`], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
       .toString()
       .trim();
   } catch {

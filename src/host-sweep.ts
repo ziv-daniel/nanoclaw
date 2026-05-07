@@ -63,17 +63,14 @@ const SWEEP_INTERVAL_MS = 60_000;
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
 // Env-overridable for ops tuning (see ops/patches/2026-04-28-max-lifetime.py).
-export const ABSOLUTE_CEILING_MS =
-  parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
+export const ABSOLUTE_CEILING_MS = parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
-export const CLAIM_STUCK_MS =
-  parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
+export const CLAIM_STUCK_MS = parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
 // Hard wall-clock cap on a single container's continuous running time.
 // Re-introduced from ziv/ops on top of upstream host-sweep. Currently
 // informational; sweep semantics live in ABSOLUTE_CEILING_MS.
-export const MAX_LIFETIME_MS =
-  parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
+export const MAX_LIFETIME_MS = parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
