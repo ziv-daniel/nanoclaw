@@ -10,6 +10,18 @@ import {
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { getRouter } from './routing/index.js';
+import type { RouteDecision } from './routing/types.js';
+
+function shortModelLabel(model: string): string {
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('haiku')) return 'haiku';
+  return model;
+}
+
+function formatRoutePrefix(d: RouteDecision): string {
+  return `[${shortModelLabel(d.model)},${d.effort}]\n`;
+}
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -182,7 +194,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin);
+      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin, routeDecision);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -207,7 +219,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        content: JSON.stringify({ text: `${formatRoutePrefix(routeDecision)}Error: ${errMsg}` }),
       });
     }
 
@@ -262,6 +274,7 @@ async function processQuery(
   initialBatchIds: string[],
   providerName: string,
   isTaskOrigin: boolean,
+  decision: RouteDecision,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -376,7 +389,7 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          dispatchResultText(event.text, routing, isTaskOrigin);
+          dispatchResultText(event.text, routing, isTaskOrigin, decision);
         }
       } else if (event.type === 'error' && event.classification === 'quota') {
         // API quota exhausted — notify the user immediately so they know
@@ -389,7 +402,7 @@ async function processQuery(
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({
-            text: '⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.\nבדוק: https://console.anthropic.com/settings/limits',
+            text: `${formatRoutePrefix(decision)}⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.\nבדוק: https://console.anthropic.com/settings/limits`,
           }),
         });
       }
@@ -431,8 +444,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean): void {
+function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean, decision: RouteDecision): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const prefix = formatRoutePrefix(decision);
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -453,7 +467,7 @@ function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin:
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, body, routing);
+    sendToDestination(dest, prefix + body, routing);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -475,13 +489,13 @@ function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin:
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: scratchpad }),
+        content: JSON.stringify({ text: prefix + scratchpad }),
       });
       return;
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
+      sendToDestination(all[0], prefix + scratchpad, routing);
       return;
     }
   }
