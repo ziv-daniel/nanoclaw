@@ -34,7 +34,11 @@ const SDK_DISALLOWED_TOOLS = [
   'ExitWorktree',
 ];
 
-// Tool allowlist for NanoClaw agent containers
+// Tool allowlist for NanoClaw agent containers. MCP-tool entries are derived
+// at the call site from the registered `mcpServers` map so that any server
+// added via `add_mcp_server` (or wired in container.json directly) is
+// reachable to the agent — without this, the SDK's allowedTools filter
+// silently drops every MCP namespace not listed here.
 const TOOL_ALLOWLIST = [
   'Bash',
   'Read',
@@ -54,8 +58,14 @@ const TOOL_ALLOWLIST = [
   'ToolSearch',
   'Skill',
   'NotebookEdit',
-  'mcp__nanoclaw__*',
 ];
+
+// MCP server names are sanitized by the SDK when forming tool prefixes:
+// any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
+// allowlist patterns match what the SDK actually exposes.
+function mcpAllowPattern(serverName: string): string {
+  return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
+}
 
 interface SDKUserMessage {
   type: 'user';
@@ -226,8 +236,12 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 /**
  * Claude Code auto-compacts context at this window (tokens). Kept here so
  * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ *
+ * Operator override: set CLAUDE_CODE_AUTO_COMPACT_WINDOW in the host env to
+ * raise or lower the threshold without editing source — useful when running
+ * with a 1M-context model variant or when emergency-tuning a deployment.
  */
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
 /**
  * Stale-session detection. Matches Claude Code's error text when a
@@ -248,10 +262,6 @@ export class ClaudeProvider implements AgentProvider {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
-    // Model + effort are now decided per-message by the routing layer
-    // (see container/agent-runner/src/routing/) and passed via QueryInput.
-    // The constructor no longer pins them — that prevented per-message
-    // switching between Haiku/Sonnet/Opus.
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -269,13 +279,6 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
-    // Per-call env overlay: routing decides model + effort per message.
-    // We must NOT mutate this.env (concurrent queries would race); build
-    // a fresh dict each call instead.
-    const callEnv: Record<string, string | undefined> = { ...this.env };
-    if (input.model) callEnv.ANTHROPIC_MODEL = input.model;
-    if (input.effort) callEnv.CLAUDE_CODE_REASONING_EFFORT = input.effort;
-
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -283,11 +286,13 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
-        model: input.model,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
-        allowedTools: TOOL_ALLOWLIST,
+        allowedTools: [
+          ...TOOL_ALLOWLIST,
+          ...Object.keys(this.mcpServers).map(mcpAllowPattern),
+        ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: callEnv,
+        env: input.model ? { ...this.env, ANTHROPIC_MODEL: input.model } : this.env,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
@@ -316,25 +321,7 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          const sdkUsage = (message as {
-            usage?: {
-              input_tokens?: number;
-              output_tokens?: number;
-              cache_creation_input_tokens?: number;
-              cache_read_input_tokens?: number;
-            };
-            model?: string;
-          }).usage;
-          const usage = sdkUsage
-            ? {
-                model: (message as { model?: string }).model,
-                input_tokens: sdkUsage.input_tokens ?? 0,
-                output_tokens: sdkUsage.output_tokens ?? 0,
-                cache_create_tokens: sdkUsage.cache_creation_input_tokens ?? 0,
-                cache_read_tokens: sdkUsage.cache_read_input_tokens ?? 0,
-              }
-            : undefined;
-          yield { type: 'result', text, usage };
+          yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

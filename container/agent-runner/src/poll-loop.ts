@@ -2,59 +2,14 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
-import { recordModelDecision } from './db/model-decisions.js';
-import { recordUsage } from './db/agent-usage.js';
-import { getRouter, type RouteDecision } from './routing/index.js';
-import fs from 'fs';
-import path from 'path';
-import { runCaveman } from './memory/caveman.js';
-import { fetchRelevantMemories, storeMemory } from './memory/qdrant-client.js';
-
-// Auto-rotate the Claude SDK session before its transcript grows past
-// the size where prompt-format drift becomes likely. Empirically a
-// 9.7 MB / 2,915-turn JSONL was severe enough that every container
-// resuming the session learned a broken response format from history.
-// Defaults: 5 MB OR 1500 turns. Tuneable via env.
-const MAX_SESSION_BYTES = parseInt(process.env.NANOCLAW_MAX_SESSION_BYTES || '', 10) || 5 * 1024 * 1024;
-const MAX_SESSION_TURNS = parseInt(process.env.NANOCLAW_MAX_SESSION_TURNS || '', 10) || 1500;
-
-function transcriptPath(continuation: string): string | null {
-  const home = process.env.HOME;
-  if (!home) return null;
-  // Claude SDK encodes the cwd into the projects dir slug: each `/`
-  // becomes `-`, leading `/` stays as a leading `-`. For a runner
-  // working in /workspace/agent that produces `-workspace-agent`.
-  const cwd = process.cwd();
-  const slug = cwd.replace(/\//g, '-');
-  return path.join(home, '.claude', 'projects', slug, `${continuation}.jsonl`);
-}
-
-/** Returns true if the caller should clear `continuation` and start fresh. */
-function maybeRotateSession(continuation: string | undefined, log: (msg: string) => void): boolean {
-  if (!continuation) return false;
-  const tp = transcriptPath(continuation);
-  if (!tp) return false;
-  let size = 0;
-  let turns = 0;
-  try {
-    size = fs.statSync(tp).size;
-    if (size <= MAX_SESSION_BYTES / 2) return false; // fast path: small file, no need to count lines
-    // Count newlines lazily — only when we're already over half the byte budget.
-    const buf = fs.readFileSync(tp);
-    turns = 0;
-    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) turns++;
-  } catch {
-    return false;
-  }
-  if (size > MAX_SESSION_BYTES || turns > MAX_SESSION_TURNS) {
-    log(`Auto-rotating session ${continuation}: ${size} bytes / ${turns} turns exceeds cap (${MAX_SESSION_BYTES} bytes / ${MAX_SESSION_TURNS} turns)`);
-    return true;
-  }
-  return false;
-}
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import {
+  clearContinuation,
+  migrateLegacyContinuation,
+  setContinuation,
+} from './db/session-state.js';
+import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { getRouter } from './routing/index.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -67,37 +22,14 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Short label for the user-visible prefix: "opus", "sonnet", "haiku", or the raw id. */
-function shortModelLabel(model: string): string {
-  if (model.includes('opus')) return 'opus';
-  if (model.includes('sonnet')) return 'sonnet';
-  if (model.includes('haiku')) return 'haiku';
-  return model;
-}
-
-/** `_[opus · high]_\n` — italic-rendered in markdown channels (Telegram, Slack). */
-function formatRoutePrefix(decision: RouteDecision): string {
-  return `_[${shortModelLabel(decision.model)} · ${decision.effort}]_\n`;
-}
-
-/** Pull representative text from the batch for routing — joins all message
- * `text` fields, capped at 2000 chars so a long pasted log doesn't dominate. */
-function extractRouteText(messages: MessageInRow[]): string {
-  const parts: string[] = [];
-  for (const m of messages) {
-    try {
-      const c = JSON.parse(m.content) as { text?: string };
-      if (c?.text) parts.push(c.text);
-    } catch {
-      // Non-JSON content (rare) — fall back to raw.
-      parts.push(m.content);
-    }
-  }
-  return parts.join('\n').slice(0, 2000);
-}
-
 export interface PollLoopConfig {
   provider: AgentProvider;
+  /**
+   * Name of the provider (e.g. "claude", "codex", "opencode"). Used to key
+   * the stored continuation per-provider so flipping providers doesn't
+   * resurrect a stale id from a different backend.
+   */
+  providerName: string;
   cwd: string;
   systemContext?: {
     instructions?: string;
@@ -118,49 +50,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
-  // other providers may reload a thread ID, etc.).
-  let continuation: string | undefined = getStoredSessionId();
+  // other providers may reload a thread ID, etc.). Keyed per-provider so
+  // a Codex thread id never gets handed to Claude or vice versa.
+  let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
-    if (maybeRotateSession(continuation, log)) {
-      continuation = undefined;
-      clearStoredSessionId();
-      log('Cleared stored session ID — next query will start a fresh Claude session.');
-    }
   }
 
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
-
-  // Startup notification — fires on every fresh container boot so you can
-  // confirm a new deployment went live without sending a test message first.
-  const _startupChannels = getAllDestinations().filter(
-    d => d.type === 'channel' && d.channelType && d.platformId,
-  );
-  if (_startupChannels.length > 0) {
-    // Include recent deploy log if n8n wrote one after the last deploy.
-    let _startupText = '🟢 Agent online';
-    try {
-      const _deployLog = fs.readFileSync(
-        path.join(import.meta.dir, '.deploy-log.txt'), 'utf8',
-      ).trim();
-      if (_deployLog) _startupText += `\n\nWhat changed:\n${_deployLog}`;
-    } catch { /* no deploy log yet — first boot or manual deploy */ }
-
-    for (const dest of _startupChannels) {
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: dest.platformId!,
-        channel_type: dest.channelType!,
-        thread_id: null,
-        content: JSON.stringify({ text: _startupText }),
-      });
-    }
-    log('Startup notification sent');
-  }
 
   let pollCount = 0;
   while (true) {
@@ -171,15 +71,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Periodic heartbeat so we know the loop is alive
     if (pollCount % 30 === 0) {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
-    }
-
-    // Periodic rotation check: if the active session has grown past
-    // the size cap mid-run, clear it so the next query starts fresh.
-    // Skipped while a query is active (would interrupt mid-turn).
-    if (pollCount % 50 === 0 && messages.length === 0 && maybeRotateSession(continuation, log)) {
-      continuation = undefined;
-      clearStoredSessionId();
-      log('Cleared stored session ID mid-run — next query will start a fresh Claude session.');
     }
 
     if (messages.length === 0) {
@@ -215,7 +106,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
-        clearStoredSessionId();
+        clearContinuation(config.providerName);
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -270,72 +161,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    // Route this turn: pick model + effort from the message content.
-    // Decision is per-turn; follow-up messages pushed mid-stream inherit it.
-    const router = getRouter();
-    const routeText = extractRouteText(keep);
+    const isTaskOrigin = keep.every(m => m.kind === 'task' || m.kind === 'webhook');
 
-    const _cavemanApiKey = process.env.ANTHROPIC_API_KEY ?? '';
-    const [cavemanResult, relevantMemories] = await Promise.all([
-      _cavemanApiKey ? runCaveman(routeText, _cavemanApiKey) : Promise.resolve(null),
-      fetchRelevantMemories(routeText, 5),
-    ]);
-    let enrichedInstructions = config.systemContext?.instructions ?? '';
-    if (cavemanResult) {
-      enrichedInstructions = `[Directive: ${cavemanResult.directive}]\n\n${enrichedInstructions}`;
-      log(`Caveman: ${cavemanResult.taskType}${cavemanResult.hint ? ` — ${cavemanResult.hint}` : ''}`);
-    }
-    if (relevantMemories.length > 0) {
-      const memBlock = relevantMemories.map(m => `- ${m.text}`).join('\n');
-      enrichedInstructions += `\n\n[Relevant context from memory:]\n${memBlock}`;
-    }
-    const enrichedSystemContext = enrichedInstructions
-      ? { ...config.systemContext, instructions: enrichedInstructions }
-      : config.systemContext;
-
-    const decision = await router.route({
-      message: routeText,
-      channelType: routing.channelType,
-      cavemanSummary: cavemanResult
-        ? `${cavemanResult.taskType}${cavemanResult.hint ? `: ${cavemanResult.hint}` : ''}`
-        : undefined,
-    });
-    log(`Route: ${decision.model} · ${decision.effort} (rule=${decision.rule})`);
-    try {
-      recordModelDecision({
-        ts: new Date().toISOString(),
-        message_id: keep[0]?.id ?? null,
-        channel_type: routing.channelType ?? null,
-        model: decision.model,
-        effort: decision.effort,
-        executor: decision.executor,
-        rule: decision.rule,
-        reason: decision.reason ?? null,
-        message_excerpt: routeText.slice(0, 200),
-        decided_by: router.kind,
-      });
-    } catch (e) {
-      // Decision logging is best-effort — never block a query on it.
-      log(`recordModelDecision failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    const routeCtx = {
+      message: keep.map(m => m.content).join(' ').slice(0, 800),
+      hasAttachment: keep.some(m => /\[(image|voice|document|video|file)\s/i.test(m.content)),
+    };
+    const routeDecision = await getRouter().route(routeCtx);
+    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'})`);
 
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
-      systemContext: enrichedSystemContext,
-      model: decision.model,
-      effort: decision.effort,
+      systemContext: config.systemContext,
+      model: routeDecision.model,
     });
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, decision);
+      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
-        setStoredSessionId(continuation);
+        setContinuation(config.providerName, continuation);
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -347,30 +197,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (continuation && config.provider.isSessionInvalid(err)) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
-        clearStoredSessionId();
+        clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong.
-      // Prefix surfaces which model failed — useful for telling "Sonnet
-      // is exhausted" apart from "auth broken".
+      // Write error response so the user knows something went wrong
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `${formatRoutePrefix(decision)}Error: ${errMsg}` }),
+        content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
     }
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
-    storeMemory(routeText, {
-      channel_type: routing.channelType ?? undefined,
-      task_type: cavemanResult?.taskType,
-      model: decision.model,
-    }).catch(() => {});
     log(`Completed ${ids.length} message(s)`);
   }
 }
@@ -417,50 +260,99 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
-  decision: RouteDecision,
+  providerName: string,
+  isTaskOrigin: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
-  // We do NOT force-end the stream on silence — keeping the query open is
-  // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
+  // We do NOT force-end the stream on silence — keeping the query open avoids
+  // re-spawning the SDK subprocess (~few seconds) and re-loading the .jsonl
+  // transcript on every turn. The Anthropic prompt cache is server-side with
+  // a 5-min TTL keyed on prefix hash, so stream lifecycle does NOT affect
+  // cache lifetime — close+reopen within 5 min still gets cache hits.
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  let pollInFlight = false;
+  let endedForCommand = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || pollInFlight || endedForCommand) return;
+    pollInFlight = true;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      return true;
-    });
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
+    void (async () => {
+      try {
+        const pending = getPendingMessages();
 
-      const prompt = formatMessages(newMessages);
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
+        // Slash commands need a fresh query: /clear resets the SDK's
+        // resume id (fixed at sdkQuery() time); admin/passthrough commands
+        // (/compact, /cost, …) only dispatch when they're the first input
+        // of a query — pushed mid-stream they arrive as plain text and
+        // the SDK never runs them. End the stream and leave the rows
+        // pending; the outer loop handles them on next iteration via the
+        // canonical command path + formatMessagesWithCommands.
+        if (pending.some((m) => isRunnerCommand(m))) {
+          log('Pending slash command — ending stream so outer loop can process');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
 
-      markCompleted(newIds);
-    }
+        // Skip system messages (MCP tool responses).
+        // Thread routing is the router's concern — if a message landed in this
+        // session, the agent should see it. Per-thread sessions already isolate
+        // threads into separate containers; shared sessions intentionally merge
+        // everything. Filtering on thread_id here caused deadlocks when the
+        // initial batch and follow-ups had mismatched thread_ids (e.g. a
+        // host-generated welcome trigger with null thread vs a Discord DM reply).
+        const newMessages = pending.filter((m) => m.kind !== 'system');
+        if (newMessages.length === 0) return;
+
+        const newIds = newMessages.map((m) => m.id);
+        markProcessing(newIds);
+
+        // Run pre-task scripts on follow-ups too — without this, a task that
+        // arrives during an active query (e.g. a */10 monitoring cron) bypasses
+        // its script gate and always wakes the agent, defeating the gate.
+        // Mirrors the initial-batch hook above.
+        let keep = newMessages;
+        let skipped: string[] = [];
+        // MODULE-HOOK:scheduling-pre-task-followup:start
+        const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+        const preTask = await applyPreTaskScripts(newMessages);
+        keep = preTask.keep;
+        skipped = preTask.skipped;
+        if (skipped.length > 0) {
+          markCompleted(skipped);
+          log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.join(', ')}`);
+        }
+        // MODULE-HOOK:scheduling-pre-task-followup:end
+
+        if (keep.length === 0) return;
+        // Re-check done — the outer query may have finished while the script
+        // was awaited. Pushing into a closed stream is wasted work; the
+        // claimed messages get released by the host's processing-claim sweep.
+        if (done) return;
+
+        const keptIds = keep.map((m) => m.id);
+        const prompt = formatMessages(keep);
+        log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        query.push(prompt);
+        markCompleted(keptIds);
+      } catch (err) {
+        // Without this catch the rejection escapes the void IIFE and Node
+        // terminates the container on unhandled-rejection. The initial-batch
+        // path is wrapped by processQuery's outer try/catch; the follow-up
+        // path is not, so it needs its own.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log(`Follow-up poll error: ${errMsg}`);
+      } finally {
+        pollInFlight = false;
+      }
+    })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
-  // Wall-clock heartbeat: touch every 5s independent of SDK events so long
-  // tool calls (MCP, OneCLI gateway, hung WebFetch) don't trigger the
-  // host-side claim-stuck/ceiling kill. The per-event touchHeartbeat below
-  // stays as a fast-path; this timer is the safety net.
-  const wallHbHandle = setInterval(() => touchHeartbeat(), 5000);
-  (wallHbHandle as { unref?: () => void }).unref?.();
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -474,7 +366,7 @@ async function processQuery(
         // container died between `init` and `result`, the SDK session was
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
-        setStoredSessionId(event.continuation);
+        setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -483,32 +375,29 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        // Capture token usage for monitoring (mcp__nanoclaw__get_usage).
-        // Best-effort — never blocks turn completion.
-        if (event.usage) {
-          try {
-            recordUsage({
-              ts: new Date().toISOString(),
-              session_id: queryContinuation ?? null,
-              model: event.usage.model ?? decision.model,
-              input_tokens: event.usage.input_tokens,
-              output_tokens: event.usage.output_tokens,
-              cache_create_tokens: event.usage.cache_create_tokens,
-              cache_read_tokens: event.usage.cache_read_tokens,
-            });
-          } catch (e) {
-            log(`recordUsage failed: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
         if (event.text) {
-          dispatchResultText(event.text, routing, decision);
+          dispatchResultText(event.text, routing, isTaskOrigin);
         }
+      } else if (event.type === 'error' && event.classification === 'quota') {
+        // API quota exhausted — notify the user immediately so they know
+        // why the agent has stopped responding.
+        log('API quota exhausted — notifying user');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text: '⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.
+בדוק: https://console.anthropic.com/settings/limits',
+          }),
+        });
       }
     }
   } finally {
     done = true;
     clearInterval(pollHandle);
-    clearInterval(wallHbHandle);
   }
 
   return { continuation: queryContinuation };
@@ -543,9 +432,8 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext, decision: RouteDecision): void {
+function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
-  const prefix = formatRoutePrefix(decision);
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -566,7 +454,7 @@ function dispatchResultText(text: string, routing: RoutingContext, decision: Rou
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, prefix + body, routing);
+    sendToDestination(dest, body, routing);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -578,7 +466,7 @@ function dispatchResultText(text: string, routing: RoutingContext, decision: Rou
   // Single-destination shortcut: the agent wrote plain text — send to
   // the session's originating channel (from session_routing) if available,
   // otherwise fall back to the single destination.
-  if (sent === 0 && scratchpad) {
+  if (sent === 0 && scratchpad && !isTaskOrigin) {
     if (routing.channelType && routing.platformId) {
       // Reply to the channel/thread the message came from
       writeMessageOut({
@@ -588,13 +476,13 @@ function dispatchResultText(text: string, routing: RoutingContext, decision: Rou
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: prefix + scratchpad }),
+        content: JSON.stringify({ text: scratchpad }),
       });
       return;
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], prefix + scratchpad, routing);
+      sendToDestination(all[0], scratchpad, routing);
       return;
     }
   }

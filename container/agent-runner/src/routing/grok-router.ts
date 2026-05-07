@@ -5,7 +5,7 @@
  * Falls back to RuleRouter on any error or timeout.
  *
  * Enable with: NANOCLAW_ROUTER=grok
- * Requires: XAI_API_KEY (also checks GROK_API_KEY, GROQ_API_KEY as fallbacks)
+ * Requires: XAI_API_KEY (also checks GROK_API_KEY as fallback)
  */
 
 import { RuleRouter } from './rule-router.js';
@@ -19,9 +19,9 @@ const TIMEOUT_MS = 10_000;
 const SYSTEM_PROMPT = `You are a routing classifier for an AI agent. Given a user message, decide the best model and effort level.
 
 Models available:
-- claude-haiku-4-5: cheap, fast. Use for greetings, simple lookups, single-step commands, status checks.
-- claude-sonnet-4-6: balanced default. Use for most tasks — coding, analysis, multi-step work.
-- claude-opus-4-6: expensive, powerful. Use ONLY for: complex architecture/planning, hard debugging, security review, anything requiring deep reasoning across many context items.
+- claude-haiku-4-5-20251001: cheap, fast. Use for: greetings, simple lookups, single-step commands, home automation commands (turn on/off lights, adjust temperature, check status of devices).
+- claude-sonnet-4-6: balanced default. Use for most tasks — coding, analysis, multi-step work, general questions.
+- claude-opus-4-7: expensive, powerful. Use ONLY for: complex architecture/planning, hard debugging, security review, anything requiring deep reasoning across many context items.
 
 Effort levels:
 - low: minimal reasoning, fast
@@ -36,7 +36,6 @@ function getXaiKey(): string | null {
   return (
     process.env.XAI_API_KEY ??
     process.env.GROK_API_KEY ??
-    process.env.GROQ_API_KEY ??
     null
   );
 }
@@ -46,6 +45,11 @@ export class GrokRouter implements Router {
   private fallback = new RuleRouter();
 
   async route(ctx: RouteContext): Promise<RouteDecision> {
+    // Attachments always go to Opus + medium for full comprehension
+    if (ctx.hasAttachment) {
+      return { model: 'claude-opus-4-7', effort: 'medium', rule: 'attachment' };
+    }
+
     const apiKey = getXaiKey();
     if (!apiKey) {
       console.error('[grok-router] No xAI API key found, falling back to rules');
@@ -87,7 +91,7 @@ export class GrokRouter implements Router {
         reason?: string;
       };
 
-      const validModels = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'];
+      const validModels = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-7'];
       const validEfforts = ['low', 'medium', 'high', 'xhigh'];
 
       const model = validModels.includes(parsed.model ?? '')
@@ -100,7 +104,6 @@ export class GrokRouter implements Router {
       return {
         model,
         effort,
-        executor: 'anthropic',
         rule: 'grok-classify',
         reason: parsed.reason,
       };

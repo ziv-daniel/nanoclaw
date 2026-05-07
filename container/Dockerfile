@@ -21,7 +21,7 @@ ARG INSTALL_CJK_FONTS=false
 # across all users.
 ARG CLAUDE_CODE_VERSION=2.1.116
 ARG AGENT_BROWSER_VERSION=latest
-ARG VERCEL_VERSION=latest
+ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
@@ -51,6 +51,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         git \
         tini \
         unzip \
+        ffmpeg \
+        python3 \
+        python3-pip \
+        tesseract-ocr \
+        jq \
+        imagemagick \
+        poppler-utils \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \

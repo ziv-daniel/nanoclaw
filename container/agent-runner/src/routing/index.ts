@@ -1,32 +1,13 @@
-/**
- * Router selector — chooses the active router implementation based on
- * NANOCLAW_ROUTER env var. Defaults to the rule-based router (no
- * external dependencies).
- *
- * Future: when 'grok' router is implemented and the xAI secret is
- * provisioned, switching is a single env-var flip.
- */
-import { RuleRouter } from './rule-router.js';
 import { GrokRouter } from './grok-router.js';
 import type { Router } from './types.js';
 
 let _router: Router | null = null;
 
+/**
+ * Returns the shared router instance.
+ * Always GrokRouter — which falls back to RuleRouter internally if no XAI_API_KEY.
+ */
 export function getRouter(): Router {
-  if (_router) return _router;
-  const kind = (process.env.NANOCLAW_ROUTER || 'rules').toLowerCase();
-  switch (kind) {
-    case 'rules':
-      _router = new RuleRouter();
-      break;
-    case 'grok':
-      _router = new GrokRouter();
-      break;
-    default:
-      console.error(`[routing] Unknown NANOCLAW_ROUTER='${kind}', falling back to 'rules'`);
-      _router = new RuleRouter();
-  }
+  if (!_router) _router = new GrokRouter();
   return _router;
 }
-
-export type { RouteContext, RouteDecision, Router, ModelId, EffortLevel, Executor } from './types.js';
