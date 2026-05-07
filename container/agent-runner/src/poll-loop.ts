@@ -389,8 +389,7 @@ async function processQuery(
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({
-            text: '⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.
-בדוק: https://console.anthropic.com/settings/limits',
+            text: '⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.\nבדוק: https://console.anthropic.com/settings/limits',
           }),
         });
       }

@@ -33,6 +33,7 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
+  deleteOrphanProcessingClaims,
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
@@ -42,30 +43,44 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer, getContainerStartedAt } from './container-runner.js';
+import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
+import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
+
+/**
+ * SQLite TIMESTAMP columns store UTC without a timezone marker. Date.parse
+ * treats timezoneless ISO strings as local time, so on non-UTC hosts every
+ * timestamp looks (TZ offset) hours stale — leading to spurious kill-claim
+ * decisions on freshly-claimed messages. Append "Z" when no zone marker is
+ * present so Date.parse interprets the string as UTC.
+ */
+export function parseSqliteUtc(s: string): number {
+  return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
+}
 
 const SWEEP_INTERVAL_MS = 60_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
-export const ABSOLUTE_CEILING_MS = parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
-// Wall-clock max-lifetime for any running container, regardless of
-// heartbeat or activity. Prevents long-lived containers from drifting
-// out of their system prompt / response format. 0 disables the cap.
-export const MAX_LIFETIME_MS = parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
+// Env-overridable for ops tuning (see ops/patches/2026-04-28-max-lifetime.py).
+export const ABSOLUTE_CEILING_MS =
+  parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
-export const CLAIM_STUCK_MS = parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
+export const CLAIM_STUCK_MS =
+  parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
+// Hard wall-clock cap on a single container's continuous running time.
+// Re-introduced from ziv/ops on top of upstream host-sweep. Currently
+// informational; sweep semantics live in ABSOLUTE_CEILING_MS.
+export const MAX_LIFETIME_MS =
+  parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
-  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number }
-  | { action: 'kill-lifetime'; lifetimeMs: number; capMs: number };
+  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
  * Pure decision for whether a running container should be killed this sweep
@@ -77,25 +92,9 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
-  containerStartedAtMs: number | null;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims, containerStartedAtMs } = args;
+  const { now, heartbeatMtimeMs, containerState, claims } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
-
-  // Wall-clock max-lifetime check. Fires even when the container is
-  // actively working — prevents prompt drift on long-lived containers.
-  // Skipped while a Bash tool with declared timeout is running, so we
-  // don't interrupt user-declared long jobs.
-  if (
-    MAX_LIFETIME_MS > 0 &&
-    containerStartedAtMs !== null &&
-    declaredBashMs === null
-  ) {
-    const lifetime = now - containerStartedAtMs;
-    if (lifetime > MAX_LIFETIME_MS) {
-      return { action: 'kill-lifetime', lifetimeMs: lifetime, capMs: MAX_LIFETIME_MS };
-    }
-  }
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
   // A freshly-spawned container hasn't had any SDK activity yet so no
@@ -115,7 +114,7 @@ export function decideStuckAction(args: {
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
   for (const claim of claims) {
-    const claimedAt = Date.parse(claim.status_changed);
+    const claimedAt = parseSqliteUtc(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
     const claimAge = now - claimedAt;
     if (claimAge <= tolerance) continue;
@@ -189,6 +188,8 @@ async function sweepSession(session: Session): Promise<void> {
     const dueCount = countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
+      // wakeContainer never throws — transient spawn failures (OneCLI down,
+      // etc.) return false and leave messages pending for the next tick.
       await wakeContainer(session);
     }
 
@@ -243,21 +244,9 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
-    containerStartedAtMs: getContainerStartedAt(session.id),
   });
 
   if (decision.action === 'ok') return;
-
-  if (decision.action === 'kill-lifetime') {
-    log.warn('Killing container past max lifetime', {
-      sessionId: session.id,
-      lifetimeMs: decision.lifetimeMs,
-      capMs: decision.capMs,
-    });
-    killContainer(session.id, 'max-lifetime');
-    resetStuckProcessingRows(inDb, outDb, session, 'max-lifetime');
-    return;
-  }
 
   if (decision.action === 'kill-ceiling') {
     log.warn('Killing container past absolute ceiling', {
@@ -280,11 +269,21 @@ function enforceRunningContainerSla(
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
+export function _resetStuckProcessingRowsForTesting(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  reason: string,
+): void {
+  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
+}
+
 function resetStuckProcessingRows(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   reason: string,
+  writableOutDb?: Database.Database,
 ): void {
   const claims = getProcessingClaims(outDb);
   const now = Date.now();
@@ -295,7 +294,7 @@ function resetStuckProcessingRows(
     // Already rescheduled for a future retry — don't bump tries again. The
     // wake path (sweep step 2) will fire when process_after elapses and a
     // fresh container will clean the orphan claim on startup.
-    if (msg.processAfter && Date.parse(msg.processAfter) > now) continue;
+    if (msg.processAfter && parseSqliteUtc(msg.processAfter) > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);
@@ -315,5 +314,23 @@ function resetStuckProcessingRows(
         reason,
       });
     }
+  }
+
+  // Drop the orphan 'processing' rows. Without this, the next sweep tick
+  // would re-read them, see the old status_changed timestamp, conclude the
+  // freshly respawned container is stuck, and SIGKILL it before its
+  // agent-runner has a chance to run clearStaleProcessingAcks() on startup.
+  const ownsDb = !writableOutDb;
+  let useDb: Database.Database | null = writableOutDb ?? null;
+  try {
+    if (!useDb) useDb = openOutboundDbRw(session.agent_group_id, session.id);
+    const cleared = deleteOrphanProcessingClaims(useDb);
+    if (cleared > 0) {
+      log.info('Cleared orphan processing claims', { sessionId: session.id, cleared, reason });
+    }
+  } catch (err) {
+    log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
+  } finally {
+    if (ownsDb) useDb?.close();
   }
 }

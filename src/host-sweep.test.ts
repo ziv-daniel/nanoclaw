@@ -30,7 +30,6 @@ describe('decideStuckAction', () => {
         heartbeatMtimeMs: BASE - 5_000,
         containerState: null,
         claims: [],
-        containerStartedAtMs: null,
       }),
     ).toEqual({ action: 'ok' });
   });
@@ -42,7 +41,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs,
       containerState: null,
       claims: [],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('kill-ceiling');
     if (res.action !== 'kill-ceiling') return;
@@ -60,7 +58,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: 0,
       containerState: null,
       claims: [],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
@@ -75,7 +72,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: 0,
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('kill-claim');
   });
@@ -92,7 +88,6 @@ describe('decideStuckAction', () => {
         tool_started_at: new Date(BASE - 45 * 60 * 1000).toISOString(),
       },
       claims: [],
-          containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
@@ -104,7 +99,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: BASE - claimedAgeMs - 5_000, // older than the claim
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('kill-claim');
     if (res.action !== 'kill-claim') return;
@@ -119,7 +113,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: BASE - 2_000, // fresh, updated after the claim
       containerState: null,
       claims: [claim('msg-1', claimedAgeMs)],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
@@ -130,7 +123,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: BASE - CLAIM_STUCK_MS - 10_000, // old, but claim is recent
       containerState: null,
       claims: [claim('msg-1', 5_000)],
-      containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
@@ -147,7 +139,6 @@ describe('decideStuckAction', () => {
         tool_started_at: new Date(BASE - 5 * 60 * 1000).toISOString(),
       },
       claims: [claim('msg-1', 5 * 60 * 1000)],
-          containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
@@ -158,7 +149,6 @@ describe('decideStuckAction', () => {
       heartbeatMtimeMs: BASE - 5_000,
       containerState: null,
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
-          containerStartedAtMs: null,
     });
     expect(res.action).toBe('ok');
   });
