@@ -63,6 +63,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir --break-system-packages --upgrade yfinance mplfinance anthropic scipy matplotlib pandas numpy
+
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
