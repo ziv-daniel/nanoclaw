@@ -1,6 +1,6 @@
 export type ModelId =
-  | 'claude-haiku-4-5-20251001'
   | 'claude-sonnet-4-6'
+  | 'claude-opus-4-6'
   | 'claude-opus-4-7';
 
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh';

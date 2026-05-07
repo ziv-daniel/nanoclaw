@@ -16,12 +16,15 @@ const XAI_URL = 'https://api.x.ai/v1/chat/completions';
 const GROK_MODEL = 'grok-3-mini';
 const TIMEOUT_MS = 10_000;
 
+const MEDIA_INTENT_RE =
+  /\b(create|generate|make|render|draw|design|produce|send)\s+(a\s+|an\s+|the\s+)?(poster|image|picture|photo|illustration|logo|banner|video|clip|voice|audio|speech|narration|tts|song|sound)\b|\bvoice\s+message\b|\btext[- ]to[- ]speech\b/i;
+
 const SYSTEM_PROMPT = `You are a routing classifier for an AI agent. Given a user message, decide the best model and effort level.
 
 Models available:
-- claude-haiku-4-5-20251001: cheap, fast. Use for: greetings, simple lookups, single-step commands, home automation commands (turn on/off lights, adjust temperature, check status of devices).
-- claude-sonnet-4-6: balanced default. Use for most tasks — coding, analysis, multi-step work, general questions.
-- claude-opus-4-7: expensive, powerful. Use ONLY for: complex architecture/planning, hard debugging, security review, anything requiring deep reasoning across many context items.
+- claude-sonnet-4-6: balanced default. Use for most tasks — greetings, simple lookups, single-step commands, home automation, coding, analysis, multi-step work, general questions. Pair with effort=low for trivial acks/greetings.
+- claude-opus-4-6: powerful reasoning. Use for hard debugging, security review, multi-file refactors, anything needing deep reasoning across many context items.
+- claude-opus-4-7: newest, best at vision/audio/video and complex multi-step work. Prefer for any media generation/consumption (images, audio, video) and the most complex architecture/planning tasks.
 
 Effort levels:
 - low: minimal reasoning, fast
@@ -45,9 +48,16 @@ export class GrokRouter implements Router {
   private fallback = new RuleRouter();
 
   async route(ctx: RouteContext): Promise<RouteDecision> {
-    // Attachments always go to Opus + medium for full comprehension
+    // Inbound media (image/audio/video attachments) → Opus 4.7
     if (ctx.hasAttachment) {
-      return { model: 'claude-opus-4-7', effort: 'medium', rule: 'attachment' };
+      return { model: 'claude-opus-4-7', effort: 'high', rule: 'attachment-media' };
+    }
+
+    // Outbound media intent — user is asking the agent to PRODUCE
+    // image/audio/video. Route to Opus 4.7 before the LLM classifier
+    // so we never miss it on classifier latency or quota.
+    if (MEDIA_INTENT_RE.test(ctx.message)) {
+      return { model: 'claude-opus-4-7', effort: 'high', rule: 'media-intent' };
     }
 
     const apiKey = getXaiKey();
@@ -91,7 +101,7 @@ export class GrokRouter implements Router {
         reason?: string;
       };
 
-      const validModels = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-7'];
+      const validModels = ['claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7'];
       const validEfforts = ['low', 'medium', 'high', 'xhigh'];
 
       const model = validModels.includes(parsed.model ?? '')
