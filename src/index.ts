@@ -13,6 +13,7 @@ import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { notifyDeployIfNew } from './modules/deploy-notification/index.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
@@ -70,6 +71,9 @@ async function main(): Promise<void> {
 
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
+
+  // 1c. Deploy notification — silent unless HEAD has advanced since last run.
+  notifyDeployIfNew();
 
   // 2. Container runtime
   ensureContainerRuntimeRunning();

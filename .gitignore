@@ -46,3 +46,7 @@ ops/.env
 # deploy script temp files
 _server_snapshot.tar.gz
 _server_extract/
+
+# Deploy notification artifacts
+data/.last-notified-deploy-sha
+logs/deploy.log
