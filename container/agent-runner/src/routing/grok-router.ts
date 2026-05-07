@@ -61,17 +61,16 @@ export class GrokRouter implements Router {
     }
 
     const apiKey = getXaiKey();
-    if (!apiKey) {
-      console.error('[grok-router] No xAI API key found, falling back to rules');
-      return this.fallback.route(ctx);
-    }
+    const authHeaders: Record<string, string> = {};
+    if (apiKey) authHeaders['Authorization'] = `Bearer ${apiKey}`;
+    // If apiKey absent, OneCLI proxy injects Authorization for api.x.ai
 
     try {
       const res = await fetch(XAI_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+          ...authHeaders,
         },
         body: JSON.stringify({
           model: GROK_MODEL,
