@@ -146,6 +146,60 @@ describe('ComposedRouter pipeline', () => {
     expect(classifier.callCount).toBe(0);
   });
 
+  test('5b. force mode + matching intent rule → intent rule wins', async () => {
+    writeOverrides({
+      mode: 'force',
+      force: { model: 'claude-opus-4-6', effort: 'medium' },
+      intentRules: [
+        {
+          match: 'chart',
+          flags: 'i',
+          model: 'claude-opus-4-7',
+          effort: 'high',
+          reason: 'chart-analysis',
+        },
+      ],
+    });
+    _resetOverridesCacheForTests();
+
+    const classifier = new StubClassifier(null);
+    const router = new ComposedRouter(classifier);
+    const decision = await router.route({
+      message: 'analyze this CHART please',
+      mediaKind: null,
+    });
+    expect(decision.model).toBe('claude-opus-4-7');
+    expect(decision.effort).toBe('high');
+    expect(decision.rule).toBe('intent-rule');
+    expect(classifier.callCount).toBe(0);
+  });
+
+  test('5c. force mode + non-matching intent rule → force still wins', async () => {
+    writeOverrides({
+      mode: 'force',
+      force: { model: 'claude-opus-4-6', effort: 'medium' },
+      intentRules: [
+        {
+          match: 'chart',
+          flags: 'i',
+          model: 'claude-opus-4-7',
+          effort: 'high',
+        },
+      ],
+    });
+    _resetOverridesCacheForTests();
+
+    const classifier = new StubClassifier(null);
+    const router = new ComposedRouter(classifier);
+    const decision = await router.route({
+      message: 'how is the weather',
+      mediaKind: null,
+    });
+    expect(decision.model).toBe('claude-opus-4-6');
+    expect(decision.effort).toBe('medium');
+    expect(decision.rule).toBe('force');
+  });
+
   test('6. intent rule fires before classifier', async () => {
     writeOverrides({
       intentRules: [

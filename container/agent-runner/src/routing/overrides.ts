@@ -29,6 +29,26 @@ function log(msg: string): void {
   console.error(`[routing-overrides] ${msg}`);
 }
 
+const VALID_REGEX_FLAGS = new Set(['i', 'm', 's', 'u', 'y', 'g']);
+
+/**
+ * JS RegExp doesn't accept Python/Perl-style inline flag groups like `(?i)`.
+ * Strip a leading `(?<flags>)` token off the pattern and merge it with any
+ * explicit `flags` field. Unknown flag chars are dropped silently — the
+ * subsequent `new RegExp(...)` call will throw if the residual is invalid.
+ */
+function stripInlineFlags(rawMatch: string, explicitFlags: string): { pattern: string; flags: string } {
+  const flagSet = new Set<string>();
+  for (const c of explicitFlags) if (VALID_REGEX_FLAGS.has(c)) flagSet.add(c);
+  let pattern = rawMatch;
+  const inline = pattern.match(/^\(\?([a-z]+)\)/i);
+  if (inline) {
+    for (const c of inline[1].toLowerCase()) if (VALID_REGEX_FLAGS.has(c)) flagSet.add(c);
+    pattern = pattern.slice(inline[0].length);
+  }
+  return { pattern, flags: Array.from(flagSet).join('') };
+}
+
 function isModel(s: unknown): s is ModelId {
   return typeof s === 'string' && (VALID_MODELS as readonly string[]).includes(s);
 }
@@ -67,19 +87,22 @@ function validateOverrides(raw: unknown, source: string): RoutingOverrides | nul
     for (const r of obj.intentRules) {
       if (!r || typeof r !== 'object') continue;
       const rr = r as Record<string, unknown>;
-      const match = typeof rr.match === 'string' ? rr.match : '';
-      if (!match || !isModel(rr.model) || !isEffort(rr.effort)) {
-        log(`${source}: skipping invalid intent rule (match=${match}, model=${String(rr.model)}, effort=${String(rr.effort)})`);
+      const rawMatch = typeof rr.match === 'string' ? rr.match : '';
+      if (!rawMatch || !isModel(rr.model) || !isEffort(rr.effort)) {
+        log(`${source}: skipping invalid intent rule (match=${rawMatch}, model=${String(rr.model)}, effort=${String(rr.effort)})`);
         continue;
       }
+      const explicitFlags = typeof rr.flags === 'string' ? rr.flags : '';
+      const { pattern, flags } = stripInlineFlags(rawMatch, explicitFlags);
       try {
-        new RegExp(match);
+        new RegExp(pattern, flags);
       } catch {
-        log(`${source}: invalid regex "${match}" — skipping`);
+        log(`${source}: invalid regex "${rawMatch}" — skipping`);
         continue;
       }
       rules.push({
-        match,
+        match: pattern,
+        ...(flags ? { flags } : {}),
         model: rr.model,
         effort: rr.effort,
         reason: typeof rr.reason === 'string' ? rr.reason : undefined,

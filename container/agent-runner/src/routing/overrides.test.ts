@@ -165,6 +165,51 @@ describe('loadOverrides', () => {
     expect(result?.intentRules?.[0]?.match).toBe('valid');
   });
 
+  test('strips (?i) inline flag into flags field', () => {
+    writeOverrides(
+      JSON.stringify({
+        intentRules: [
+          {
+            match: '(?i)\\b(chart|RSI|MACD)\\b',
+            model: 'claude-opus-4-7',
+            effort: 'high',
+            reason: 'chart-analysis',
+          },
+        ],
+      }),
+    );
+    const result = loadOverrides();
+    expect(result?.intentRules).toHaveLength(1);
+    expect(result?.intentRules?.[0]).toEqual({
+      match: '\\b(chart|RSI|MACD)\\b',
+      flags: 'i',
+      model: 'claude-opus-4-7',
+      effort: 'high',
+      reason: 'chart-analysis',
+    });
+  });
+
+  test('merges explicit flags field with inline (?ms) prefix', () => {
+    writeOverrides(
+      JSON.stringify({
+        intentRules: [
+          {
+            match: '(?m)^breakout',
+            flags: 'i',
+            model: 'claude-opus-4-7',
+            effort: 'high',
+          },
+        ],
+      }),
+    );
+    const result = loadOverrides();
+    expect(result?.intentRules).toHaveLength(1);
+    const rule = result?.intentRules?.[0];
+    expect(rule?.match).toBe('^breakout');
+    // Both i (explicit) and m (inline) should be present.
+    expect(rule?.flags?.split('').sort().join('')).toBe('im');
+  });
+
   test('returns null for malformed JSON (does NOT throw)', () => {
     writeOverrides('{ this is not json');
     expect(() => loadOverrides()).not.toThrow();

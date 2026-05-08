@@ -16,8 +16,11 @@ import type {
  *   1. Inline hint              `[route:<model>,<effort>]` at message start
  *   2. Bypass rules             attachment / media-intent (skipped under
  *                               force mode unless `respectBypassRules:true`)
- *   3. Force mode               from `routing.json` `mode:"force"`
- *   4. Intent rules             from `routing.json` `intentRules[]`
+ *   3. Intent rules             from `routing.json` `intentRules[]` —
+ *                               run BEFORE force so per-agent escalations
+ *                               (e.g. chart keywords → opus-4-7/high) can
+ *                               win over a force-mode floor
+ *   4. Force mode               from `routing.json` `mode:"force"`
  *   5. Classifier               Haiku-based remote call
  *   6. Per-agent default        from `routing.json` `default`
  *   7. Global default           sonnet/medium
@@ -50,21 +53,12 @@ export class ComposedRouter implements Router {
       if (bypass) return bypass;
     }
 
-    // 3. Force mode
-    if (isForce && overrides?.force) {
-      return {
-        model: overrides.force.model,
-        effort: overrides.force.effort,
-        rule: 'force',
-        reason: 'agent override mode=force',
-      };
-    }
-
-    // 4. Intent rules
+    // 3. Intent rules — run before force so per-agent escalations can
+    //    upgrade above a force-mode floor (e.g. chart-keyword → opus-4-7).
     if (overrides?.intentRules) {
       for (const rule of overrides.intentRules) {
         try {
-          if (new RegExp(rule.match).test(ctx.message)) {
+          if (new RegExp(rule.match, rule.flags ?? '').test(ctx.message)) {
             return {
               model: rule.model,
               effort: rule.effort,
@@ -77,6 +71,16 @@ export class ComposedRouter implements Router {
           // defensive in case the cache holds a bad rule somehow.
         }
       }
+    }
+
+    // 4. Force mode
+    if (isForce && overrides?.force) {
+      return {
+        model: overrides.force.model,
+        effort: overrides.force.effort,
+        rule: 'force',
+        reason: 'agent override mode=force',
+      };
     }
 
     // 5. Classifier

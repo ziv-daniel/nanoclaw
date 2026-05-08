@@ -93,6 +93,7 @@ export interface RoutingOverrides {
    */
   intentRules?: Array<{
     match: string;
+    flags?: string;
     model: ModelId;
     effort: EffortLevel;
     reason?: string;
