@@ -1,6 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
+import { recordModelDecision } from './db/model-decisions.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
@@ -9,19 +10,13 @@ import {
 } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { detectMediaKind } from './routing/media-detect.js';
 import { getRouter } from './routing/index.js';
+import {
+  getCurrentDecision,
+  setCurrentDecision,
+} from './routing/turn-context.js';
 import type { RouteDecision } from './routing/types.js';
-
-function shortModelLabel(model: string): string {
-  if (model.includes('opus')) return 'opus';
-  if (model.includes('sonnet')) return 'sonnet';
-  if (model.includes('haiku')) return 'haiku';
-  return model;
-}
-
-function formatRoutePrefix(d: RouteDecision): string {
-  return `[${shortModelLabel(d.model)},${d.effort}]\n`;
-}
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -119,6 +114,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
         clearContinuation(config.providerName);
+        // No active turn decision — emit the ack without a route prefix.
+        setCurrentDecision(null);
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -175,12 +172,32 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const isTaskOrigin = keep.every(m => m.kind === 'task' || m.kind === 'webhook');
 
+    const routeMessage = keep.map(m => m.content).join(' ').slice(0, 800);
     const routeCtx = {
-      message: keep.map(m => m.content).join(' ').slice(0, 800),
-      hasAttachment: keep.some(m => /\[(image|voice|document|video|file)\s/i.test(m.content)),
+      message: routeMessage,
+      mediaKind: detectMediaKind(keep),
     };
     const routeDecision = await getRouter().route(routeCtx);
-    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'})`);
+    setCurrentDecision(routeDecision);
+    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'}${routeDecision.reason ? ` — ${routeDecision.reason}` : ''})`);
+
+    // Persist the decision so `get_routing_history` MCP tool can show it.
+    try {
+      recordModelDecision({
+        ts: new Date().toISOString(),
+        message_id: keep[0]?.id ?? null,
+        channel_type: routing.channelType ?? null,
+        model: routeDecision.model,
+        effort: routeDecision.effort,
+        executor: config.providerName,
+        rule: routeDecision.rule ?? 'default',
+        reason: routeDecision.reason ?? null,
+        message_excerpt: routeMessage.slice(0, 200),
+        decided_by: routeDecision.rule === 'haiku-classify' ? 'classifier' : 'rules',
+      });
+    } catch (e) {
+      log(`Failed to record model decision: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     const query = config.provider.query({
       prompt,
@@ -194,7 +211,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin, routeDecision);
+      const result = await processQuery(query, routing, processingIds, config.providerName, isTaskOrigin);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -212,15 +229,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong.
+      // The route prefix is auto-applied by writeMessageOut from the
+      // active turn decision (see messages-out.ts).
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `${formatRoutePrefix(routeDecision)}Error: ${errMsg}` }),
+        content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+    } finally {
+      setCurrentDecision(null);
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -274,7 +295,6 @@ async function processQuery(
   initialBatchIds: string[],
   providerName: string,
   isTaskOrigin: boolean,
-  decision: RouteDecision,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -389,12 +409,13 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          dispatchResultText(event.text, routing, isTaskOrigin, decision);
+          dispatchResultText(event.text, routing, isTaskOrigin);
         }
       } else if (event.type === 'error' && event.classification === 'quota') {
         // API quota exhausted — notify the user immediately so they know
         // why the agent has stopped responding.
         log('API quota exhausted — notifying user');
+        // Route prefix auto-applied by writeMessageOut from the active turn.
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -402,7 +423,7 @@ async function processQuery(
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({
-            text: `${formatRoutePrefix(decision)}⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.\nבדוק: https://console.anthropic.com/settings/limits`,
+            text: `⚠️ מכסת ה-API מוצתה — לא ניתן להמשיך לעבוד.\nבדוק: https://console.anthropic.com/settings/limits`,
           }),
         });
       }
@@ -443,10 +464,11 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * cleaned text (with <internal> tags stripped) is sent to that destination.
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
+ *
+ * The route prefix is applied automatically by writeMessageOut, NOT here.
  */
-function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean, decision: RouteDecision): void {
+function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin: boolean): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
-  const prefix = formatRoutePrefix(decision);
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -467,7 +489,7 @@ function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin:
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
-    sendToDestination(dest, prefix + body, routing);
+    sendToDestination(dest, body, routing);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -489,13 +511,13 @@ function dispatchResultText(text: string, routing: RoutingContext, isTaskOrigin:
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: prefix + scratchpad }),
+        content: JSON.stringify({ text: scratchpad }),
       });
       return;
     }
     const all = getAllDestinations();
     if (all.length === 1) {
-      sendToDestination(all[0], prefix + scratchpad, routing);
+      sendToDestination(all[0], scratchpad, routing);
       return;
     }
   }
@@ -525,6 +547,9 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     content: JSON.stringify({ text: body }),
   });
 }
+
+/** Re-export for tests that want to read the active turn's decision. */
+export { getCurrentDecision };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

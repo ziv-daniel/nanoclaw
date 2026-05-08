@@ -39,7 +39,12 @@ SERVER_SRC = "/opt/nanoclaw-v2/container/agent-runner/src"
 def _req(method, path, body=None, token=None):
     url = f"{PORTAINER_URL}{path}"
     data = json.dumps(body).encode() if body else None
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # Some upstreams (Cloudflare, WAF) reject the default Python urllib UA
+        # with 403 — provide a generic browser-like UA so auth goes through.
+        "User-Agent": "Mozilla/5.0 nanoclaw-deploy",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -48,7 +53,15 @@ def _req(method, path, body=None, token=None):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-        return json.loads(resp.read())
+        raw = resp.read()
+    # Some endpoints (container start, delete) return 204 No Content with an
+    # empty body. Don't crash trying to JSON-parse an empty response.
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 def get_token():
     r = _req("POST", "/api/auth", {"username": PORTAINER_USER, "password": PORTAINER_PASS})
@@ -74,7 +87,7 @@ def run_container(token, cmd_str, binds=None, privileged=False, pid_mode=None):
 def get_logs(token, cid, tail=200):
     import ssl, urllib.parse
     url = f"{PORTAINER_URL}/api/endpoints/{ENDPOINT_ID}/docker/containers/{cid}/logs?stdout=true&stderr=true&tail={tail}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0 nanoclaw-deploy"})
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
         raw = resp.read()
@@ -91,7 +104,7 @@ def get_logs(token, cid, tail=200):
 def delete_container(token, cid):
     import ssl
     url = f"{PORTAINER_URL}/api/endpoints/{ENDPOINT_ID}/docker/containers/{cid}?force=true"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="DELETE")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0 nanoclaw-deploy"}, method="DELETE")
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     try:
         urllib.request.urlopen(req, context=ctx, timeout=10)
@@ -103,7 +116,7 @@ def wait_for_exit(token, cid, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         url = f"{PORTAINER_URL}/api/endpoints/{ENDPOINT_ID}/docker/containers/{cid}/json"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0 nanoclaw-deploy"})
         ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
             state = json.loads(resp.read())["State"]
@@ -131,7 +144,7 @@ def upload_file(token, local_path, remote_rel):
     if "UPLOAD_OK" not in logs:
         print(f"  ERROR uploading {remote_rel}: {logs[:200]}")
         return False
-    print(f"  ✓ {remote_rel} ({len(content)} bytes)")
+    print(f"  OK {remote_rel} ({len(content)} bytes)")
     return True
 
 def get_server_md5(token, files):
@@ -235,9 +248,9 @@ def main():
         delete_container(token, cid)
         print(logs)
         if "TSC_EXIT:0" in logs:
-            print("✓ tsc passed — no type errors.")
+            print("OK tsc passed - no type errors.")
         else:
-            print("✗ tsc failed — fix errors before deploying.")
+            print("FAIL tsc failed - fix errors before deploying.")
             sys.exit(1)
 
     print("\nDone. Kill the running agent container so the next message picks up the new code:")

@@ -18,7 +18,7 @@ export interface ModelDecisionRow {
   rule: string;
   reason: string | null;
   message_excerpt: string;
-  decided_by: 'rules' | 'grok';
+  decided_by: 'rules' | 'classifier';
 }
 
 // CREATE IF NOT EXISTS is cheap; we run it per-call rather than caching

@@ -4,6 +4,7 @@
  * Writes to outbound.db (container-owned).
  * The host polls this DB (read-only) for undelivered messages.
  */
+import { formatRoutePrefix, hasRoutePrefix } from '../routing/turn-context.js';
 import { getInboundDb, getOutboundDb } from './connection.js';
 
 export interface MessageOutRow {
@@ -33,6 +34,53 @@ export interface WriteMessageOut {
 }
 
 /**
+ * Apply the `[model,effort]` route prefix to user-visible text inside
+ * the outbound content payload. Idempotent — skips if the text already
+ * carries a prefix.
+ *
+ * Behavior by kind:
+ *   chat        — prefix `.text`
+ *   chat-sdk    — prefix `.text` (system messages, replies),
+ *                 `.question` for `ask_question` cards,
+ *                 leave structured cards / control ops untouched
+ *   system,
+ *   internal    — no prefix (these aren't user-facing)
+ *
+ * For chat-edit operations (`{ operation: "edit", text: ... }`),
+ * the new replacement text is prefixed too.
+ */
+function applyRoutePrefixToContent(kind: string, content: string): string {
+  if (kind !== 'chat' && kind !== 'chat-sdk') return content;
+  const prefix = formatRoutePrefix();
+  if (!prefix) return content;
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return content; // not JSON — leave alone
+  }
+  if (!parsed || typeof parsed !== 'object') return content;
+
+  let mutated = false;
+
+  if (typeof parsed.text === 'string' && !hasRoutePrefix(parsed.text)) {
+    parsed.text = prefix + parsed.text;
+    mutated = true;
+  }
+  if (
+    parsed.type === 'ask_question' &&
+    typeof parsed.question === 'string' &&
+    !hasRoutePrefix(parsed.question)
+  ) {
+    parsed.question = prefix + parsed.question;
+    mutated = true;
+  }
+
+  return mutated ? JSON.stringify(parsed) : content;
+}
+
+/**
  * Write a new outbound message, auto-assigning an odd seq number.
  * Container uses odd seq (1, 3, 5...), host uses even (2, 4, 6...).
  *
@@ -41,6 +89,13 @@ export interface WriteMessageOut {
  * by edit_message / add_reaction, and getMessageIdBySeq() below looks up
  * by seq across BOTH tables. If inbound and outbound could share a seq,
  * the agent's "edit message #5" could resolve to the wrong row.
+ *
+ * Side effect: chat / chat-sdk content is auto-prefixed with the active
+ * turn's `[model,effort]` route prefix. This is the single chokepoint
+ * for the prefix — every send path (poll-loop dispatch, send_message
+ * MCP tool, send_file caption, edit_message, ask_user_question) flows
+ * through here, so the prefix is consistent without each call site
+ * having to thread the route decision around.
  */
 export function writeMessageOut(msg: WriteMessageOut): number {
   const outbound = getOutboundDb();
@@ -52,6 +107,8 @@ export function writeMessageOut(msg: WriteMessageOut): number {
   const maxIn = (inbound.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
   const max = Math.max(maxOut, maxIn);
   const nextSeq = max % 2 === 0 ? max + 1 : max + 2; // next odd
+
+  const finalContent = applyRoutePrefixToContent(msg.kind, msg.content);
 
   // bun:sqlite requires named parameters to be passed with the prefix character
   // in the JS object keys (better-sqlite3 auto-stripped it, bun:sqlite does not).
@@ -70,7 +127,7 @@ export function writeMessageOut(msg: WriteMessageOut): number {
       $platform_id: msg.platform_id ?? null,
       $channel_type: msg.channel_type ?? null,
       $thread_id: msg.thread_id ?? null,
-      $content: msg.content,
+      $content: finalContent,
     });
 
   return nextSeq;

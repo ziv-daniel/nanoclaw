@@ -5,13 +5,18 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
+import { setCurrentDecision } from './routing/turn-context.js';
 
 beforeEach(() => {
   initTestSessionDb();
+  // Clear any residual turn decision left by other tests in the same process
+  // (integration.test.ts shares the runtime and sets a decision via runPollLoop).
+  setCurrentDecision(null);
 });
 
 afterEach(() => {
   closeSessionDb();
+  setCurrentDecision(null);
 });
 
 function insertMessage(id: string, kind: string, content: object, opts?: { processAfter?: string; trigger?: 0 | 1 }) {
