@@ -332,6 +332,24 @@ async function processQuery(
           return;
         }
 
+        // Chat arriving mid-task should not inherit the task's routing
+        // decision. A scheduled task (e.g. trading screener) routes to
+        // opus-4-6/high; if the user then sends "ping" while that task
+        // is still streaming, pushing the chat in-band makes the reply
+        // run under the task's model + carry the task's [opus,high]
+        // prefix — which is honest about what ran but absurd for the
+        // content. End the stream here so the outer loop gives the chat
+        // its own routing decision (likely sonnet/low for trivial chat).
+        if (
+          isTaskOrigin &&
+          pending.some((m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && !isRunnerCommand(m))
+        ) {
+          log('Chat arrived mid-task — ending stream so outer loop can re-route');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
+
         // Skip system messages (MCP tool responses).
         // Thread routing is the router's concern — if a message landed in this
         // session, the agent should see it. Per-thread sessions already isolate
