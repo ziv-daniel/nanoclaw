@@ -307,7 +307,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const matched = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matched?.selectedLabel ?? selectedOption ?? '(clicked)';
 
-        // Update the card to show the selected answer and remove buttons
+        // Dispatch to the host immediately so approval handlers (kill +
+        // respawn for add_mcp_server, etc.) start running while the card
+        // edit is in flight. Edit + dispatch were sequential previously,
+        // which made the button feel stuck on slow editMessage round-trips
+        // and also delayed the approval applying.
+        setupConfig.onAction(questionId, selectedOption, userId);
+
+        // Update the card to show the selected answer and remove buttons.
+        // Best-effort — failure is logged but doesn't block the dispatch.
         try {
           const tid = event.threadId;
           await adapter.editMessage(tid, event.messageId, {
@@ -316,8 +324,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
-
-        setupConfig.onAction(questionId, selectedOption, userId);
       });
 
       await chat.initialize();

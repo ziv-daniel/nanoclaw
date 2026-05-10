@@ -251,7 +251,7 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
+    void killContainer(session.id, 'absolute-ceiling');
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -262,7 +262,7 @@ function enforceRunningContainerSla(
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
-  killContainer(session.id, 'claim-stuck');
+  void killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 

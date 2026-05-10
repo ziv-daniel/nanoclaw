@@ -36,7 +36,7 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
   log.info('Package install approved', { agentGroupId: session.agent_group_id, userId });
   try {
     await buildAgentGroupImage(session.agent_group_id);
-    killContainer(session.id, 'rebuild applied');
+    await killContainer(session.id, 'rebuild applied');
     // Schedule a follow-up prompt a few seconds after kill so the host sweep
     // respawns the container on the new image and the agent verifies + reports.
     writeSessionMessage(session.agent_group_id, session.id, {
@@ -79,7 +79,11 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     };
   });
 
-  killContainer(session.id, 'mcp server added');
-  notify(`MCP server "${payload.name}" added. Your container will restart with it on the next message.`);
+  // Await the kill so the activeContainers slot is free before the response
+  // handler's follow-up `wakeContainer(session)` runs — otherwise it sees the
+  // dying container as still running and skips the spawn, leaving the new
+  // MCP server unloaded until the next host-sweep tick (~60s).
+  await killContainer(session.id, 'mcp server added');
+  notify(`MCP server "${payload.name}" added. Your container is restarting with it now.`);
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id, userId });
 };
