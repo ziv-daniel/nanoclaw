@@ -100,7 +100,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+# pnpm 11+ installs global bins into $PNPM_HOME/bin (not $PNPM_HOME). Both
+# directories are kept in PATH so shell lookups work either way. The Claude
+# Agent SDK hardcodes /pnpm/claude, so we symlink each global bin back into
+# $PNPM_HOME after install — see the symlink step at the end of this block.
+ENV PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -113,6 +117,10 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# Compat shim for consumers (Claude Agent SDK) that hardcode /pnpm/<bin>
+# instead of resolving via PATH.
+RUN for f in /pnpm/bin/*; do ln -sf "$f" "/pnpm/$(basename "$f")"; done
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
