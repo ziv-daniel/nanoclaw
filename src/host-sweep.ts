@@ -176,33 +176,32 @@ async function sweepSession(session: Session): Promise<void> {
       syncProcessingAcks(inDb, outDb);
     }
 
-    // 2. Wake a container if work is due and nothing is running. Ordered
-    // before the crashed-container cleanup so a fresh container gets a chance
-    // to clean its own orphan processing_ack rows on startup (see
-    // container/agent-runner/src/db/connection.ts). Otherwise the reset path
-    // would keep bumping process_after into the future, dueCount would stay 0,
-    // and the wake would never fire.
+    // 2. Crashed-container cleanup: processing rows left behind get retried.
+    // Ordered BEFORE the wake step so tries is incremented and process_after
+    // is set in inbound.db before the new container starts. Otherwise the
+    // new container's clearStaleProcessingAcks() races with this sweep —
+    // deleting the orphan claims first means the next sweep sees no claims,
+    // never bumps tries, and the message reprocesses immediately in a loop.
+    // resetStuckProcessingRows itself is idempotent — it skips messages
+    // already scheduled for a future retry.
+    if (!isContainerRunning(session.id) && outDb) {
+      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+    }
+
+    // 3. Wake a container if work is due and nothing is running.
+    // wakeContainer never throws — transient spawn failures (OneCLI down,
+    // etc.) return false and leave messages pending for the next tick.
     const dueCount = countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
-      // wakeContainer never throws — transient spawn failures (OneCLI down,
-      // etc.) return false and leave messages pending for the next tick.
       await wakeContainer(session);
     }
 
     const alive = isContainerRunning(session.id);
 
-    // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
+    // 4. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
       enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
-    }
-
-    // 4. Crashed-container cleanup: processing rows left behind get retried.
-    // Only fires when wake in step 2 didn't pick up the work (no due messages,
-    // or wake failed). resetStuckProcessingRows itself is idempotent — it
-    // skips messages already scheduled for a future retry.
-    if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
 
     // 5. Recurrence fanout for completed recurring tasks.

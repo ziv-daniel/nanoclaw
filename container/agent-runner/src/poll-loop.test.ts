@@ -134,6 +134,30 @@ describe('accumulate gate (trigger column)', () => {
   });
 });
 
+describe('retry budget', () => {
+  it('getPendingMessages skips rows with tries >= 5 (safety net for orphan-claim race)', () => {
+    // Defense-in-depth against the host-sweep orphan cleanup race: even if
+    // host fails to bump tries before respawn, the container refuses to pick
+    // up messages that have already exhausted their retry budget.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, tries, content)
+         VALUES ('exhausted', 'chat', datetime('now'), 'pending', 5, '{"text":"loop"}')`,
+      )
+      .run();
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, tries, content)
+         VALUES ('eligible', 'chat', datetime('now'), 'pending', 4, '{"text":"ok"}')`,
+      )
+      .run();
+
+    const ids = getPendingMessages().map((m) => m.id);
+    expect(ids).toContain('eligible');
+    expect(ids).not.toContain('exhausted');
+  });
+});
+
 describe('routing', () => {
   it('should extract routing from messages', () => {
     getInboundDb()
