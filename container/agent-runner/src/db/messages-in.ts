@@ -54,10 +54,15 @@ export function getPendingMessages(): MessageInRow[] {
   const outbound = getOutboundDb();
 
   try {
+    // tries < 5 is a defense-in-depth guard: even if the host-sweep orphan
+    // cleanup loses a race (see src/host-sweep.ts step 2), the container
+    // refuses to pick up messages that have already exhausted their retry
+    // budget. Matches MAX_TRIES on the host side.
     const pending = inbound
       .prepare(
         `SELECT * FROM messages_in
          WHERE status = 'pending'
+           AND tries < 5
            AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
          ORDER BY seq DESC
          LIMIT ?`,
