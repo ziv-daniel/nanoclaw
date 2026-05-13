@@ -6,11 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, initTestDb } from './connection.js';
 import { runMigrations } from './migrations/index.js';
-import {
-  getRecentSweepErrors,
-  getSweepErrorStats,
-  recordSweepError,
-} from './sweep-errors.js';
+import { getRecentSweepErrors, getSweepErrorStats, recordSweepError } from './sweep-errors.js';
 
 beforeEach(() => {
   const db = initTestDb();

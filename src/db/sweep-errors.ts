@@ -52,15 +52,7 @@ export function recordSweepError(input: SweepErrorInput): void {
          (session_id, agent_group_id, phase, error_type, error_message, stack, occurred_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(
-      input.session_id,
-      input.agent_group_id,
-      input.phase,
-      type,
-      message,
-      stack,
-      new Date().toISOString(),
-    );
+    .run(input.session_id, input.agent_group_id, input.phase, type, message, stack, new Date().toISOString());
 }
 
 /** Most recent N error rows for a session — useful for `/debug` skill output. */
