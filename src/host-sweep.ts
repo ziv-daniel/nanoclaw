@@ -31,6 +31,7 @@ import fs from 'fs';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { recordSweepError } from './db/sweep-errors.js';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
@@ -137,13 +138,36 @@ export function stopHostSweep(): void {
 async function sweep(): Promise<void> {
   if (!running) return;
 
+  let sessions: Session[];
   try {
-    const sessions = getActiveSessions();
-    for (const session of sessions) {
-      await sweepSession(session);
-    }
+    sessions = getActiveSessions();
   } catch (err) {
-    log.error('Host sweep error', { err });
+    // Failure to even enumerate sessions is a central-DB problem, not a
+    // per-session one — log it and try again next tick.
+    log.error('Host sweep enumeration error', { err });
+    setTimeout(sweep, SWEEP_INTERVAL_MS);
+    return;
+  }
+
+  // Per-session try/catch: one bad session DB (missing tables, locked file,
+  // etc.) must NOT prevent every later session from being swept. Errors are
+  // persisted to session_sweep_errors for post-mortem stats.
+  for (const session of sessions) {
+    try {
+      await sweepSession(session);
+    } catch (err) {
+      log.error('Host sweep session error', { sessionId: session.id, err });
+      try {
+        recordSweepError({
+          session_id: session.id,
+          agent_group_id: session.agent_group_id ?? null,
+          phase: 'host-sweep',
+          error: err,
+        });
+      } catch (recordErr) {
+        log.error('Failed to record sweep error', { sessionId: session.id, err: recordErr });
+      }
+    }
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
