@@ -12,6 +12,7 @@ import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRu
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { detectMediaKind } from './routing/media-detect.js';
 import { getRouter } from './routing/index.js';
+import { enforceOpusEffortCap } from './routing/opus-effort-cap.js';
 import {
   getCurrentDecision,
   setCurrentDecision,
@@ -177,7 +178,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       message: routeMessage,
       mediaKind: detectMediaKind(keep),
     };
-    const routeDecision = await getRouter().route(routeCtx);
+    const rawDecision = await getRouter().route(routeCtx);
+    // System-wide Opus effort cap. Runs after the full pipeline so it sees
+    // the final decision regardless of source (classifier, intent rule,
+    // default, inline hint). Force mode and video attachments are exempt.
+    const routeDecision = enforceOpusEffortCap(rawDecision, routeCtx.mediaKind);
     setCurrentDecision(routeDecision);
     log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'}${routeDecision.reason ? ` — ${routeDecision.reason}` : ''})`);
 
