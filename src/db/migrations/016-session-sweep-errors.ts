@@ -12,8 +12,8 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
-export const migration014: Migration = {
-  version: 14,
+export const migration016: Migration = {
+  version: 16,
   name: 'session-sweep-errors',
   up(db: Database.Database) {
     db.exec(`

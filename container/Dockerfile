@@ -19,7 +19,7 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.116
+ARG CLAUDE_CODE_VERSION=2.1.128
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
@@ -101,11 +101,15 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-# Pin pnpm to v10. pnpm 11 changed the global bin layout (/pnpm/bin instead
-# of /pnpm) and broke claude-code's platform-native optional-dep postinstall,
-# leaving consumers that hardcode /pnpm/claude (Claude Agent SDK) without a
-# working binary. Keep on v10 until upstream + SDK align with the v11 layout.
-RUN corepack enable && corepack prepare pnpm@10.33.4 --activate
+# Pin pnpm to match the host (package.json packageManager). pnpm 11 changed
+# the global bin layout (/pnpm/bin instead of /pnpm) AND stopped honoring
+# `only-built-dependencies[]=` in .npmrc for global installs — both break
+# the claude-code platform-native postinstall and agent-browser bin chmod,
+# leaving consumers that hardcode /pnpm/claude (Claude Agent SDK) crashing
+# with "native binary not installed". Keep this in lockstep with
+# package.json's `packageManager`.
+ARG PNPM_VERSION=10.33.4
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
@@ -117,6 +121,11 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# ---- ncl CLI wrapper ----------------------------------------------------------
+# Actual script lives in the mounted source at /app/src/cli/ncl.ts.
+RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
+    chmod +x /usr/local/bin/ncl
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
