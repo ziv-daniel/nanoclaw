@@ -99,6 +99,8 @@ async function main(): Promise<void> {
       ANTHROPIC_MODEL: config.model || DEFAULT_MODEL,
     },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    model: config.model,
+    effort: config.effort,
   });
 
   await runPollLoop({
