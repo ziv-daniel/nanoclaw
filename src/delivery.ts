@@ -12,6 +12,7 @@ import type Database from 'better-sqlite3';
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { recordSweepError } from './db/sweep-errors.js';
 import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
@@ -121,13 +122,33 @@ export function startSweepDeliveryPoll(): void {
 async function pollActive(): Promise<void> {
   if (!activePolling) return;
 
+  let sessions: Session[];
   try {
-    const sessions = getRunningSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    sessions = getRunningSessions();
   } catch (err) {
-    log.error('Active delivery poll error', { err });
+    log.error('Active delivery enumeration error', { err });
+    setTimeout(pollActive, ACTIVE_POLL_MS);
+    return;
+  }
+
+  // Per-session isolation: a session whose outbound.db is missing tables /
+  // locked / corrupt must not poison the rest of the loop for this tick.
+  for (const session of sessions) {
+    try {
+      await deliverSessionMessages(session);
+    } catch (err) {
+      log.error('Active delivery session error', { sessionId: session.id, err });
+      try {
+        recordSweepError({
+          session_id: session.id,
+          agent_group_id: session.agent_group_id ?? null,
+          phase: 'active-delivery',
+          error: err,
+        });
+      } catch (recordErr) {
+        log.error('Failed to record delivery error', { sessionId: session.id, err: recordErr });
+      }
+    }
   }
 
   setTimeout(pollActive, ACTIVE_POLL_MS);
@@ -136,13 +157,31 @@ async function pollActive(): Promise<void> {
 async function pollSweep(): Promise<void> {
   if (!sweepPolling) return;
 
+  let sessions: Session[];
   try {
-    const sessions = getActiveSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    sessions = getActiveSessions();
   } catch (err) {
-    log.error('Sweep delivery poll error', { err });
+    log.error('Sweep delivery enumeration error', { err });
+    setTimeout(pollSweep, SWEEP_POLL_MS);
+    return;
+  }
+
+  for (const session of sessions) {
+    try {
+      await deliverSessionMessages(session);
+    } catch (err) {
+      log.error('Sweep delivery session error', { sessionId: session.id, err });
+      try {
+        recordSweepError({
+          session_id: session.id,
+          agent_group_id: session.agent_group_id ?? null,
+          phase: 'sweep-delivery',
+          error: err,
+        });
+      } catch (recordErr) {
+        log.error('Failed to record delivery error', { sessionId: session.id, err: recordErr });
+      }
+    }
   }
 
   setTimeout(pollSweep, SWEEP_POLL_MS);

@@ -31,6 +31,7 @@ import fs from 'fs';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { recordSweepError } from './db/sweep-errors.js';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
@@ -62,10 +63,15 @@ const SWEEP_INTERVAL_MS = 60_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
-export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
+// Env-overridable for ops tuning (see ops/patches/2026-04-28-max-lifetime.py).
+export const ABSOLUTE_CEILING_MS = parseInt(process.env.NANOCLAW_ABSOLUTE_CEILING_MS || '', 10) || 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
-export const CLAIM_STUCK_MS = 60 * 1000;
+export const CLAIM_STUCK_MS = parseInt(process.env.NANOCLAW_CLAIM_STUCK_MS || '', 10) || 60 * 1000;
+// Hard wall-clock cap on a single container's continuous running time.
+// Re-introduced from ziv/ops on top of upstream host-sweep. Currently
+// informational; sweep semantics live in ABSOLUTE_CEILING_MS.
+export const MAX_LIFETIME_MS = parseInt(process.env.NANOCLAW_MAX_LIFETIME_MS || '', 10) || 4 * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -132,13 +138,36 @@ export function stopHostSweep(): void {
 async function sweep(): Promise<void> {
   if (!running) return;
 
+  let sessions: Session[];
   try {
-    const sessions = getActiveSessions();
-    for (const session of sessions) {
-      await sweepSession(session);
-    }
+    sessions = getActiveSessions();
   } catch (err) {
-    log.error('Host sweep error', { err });
+    // Failure to even enumerate sessions is a central-DB problem, not a
+    // per-session one — log it and try again next tick.
+    log.error('Host sweep enumeration error', { err });
+    setTimeout(sweep, SWEEP_INTERVAL_MS);
+    return;
+  }
+
+  // Per-session try/catch: one bad session DB (missing tables, locked file,
+  // etc.) must NOT prevent every later session from being swept. Errors are
+  // persisted to session_sweep_errors for post-mortem stats.
+  for (const session of sessions) {
+    try {
+      await sweepSession(session);
+    } catch (err) {
+      log.error('Host sweep session error', { sessionId: session.id, err });
+      try {
+        recordSweepError({
+          session_id: session.id,
+          agent_group_id: session.agent_group_id ?? null,
+          phase: 'host-sweep',
+          error: err,
+        });
+      } catch (recordErr) {
+        log.error('Failed to record sweep error', { sessionId: session.id, err: recordErr });
+      }
+    }
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
@@ -171,33 +200,32 @@ async function sweepSession(session: Session): Promise<void> {
       syncProcessingAcks(inDb, outDb);
     }
 
-    // 2. Wake a container if work is due and nothing is running. Ordered
-    // before the crashed-container cleanup so a fresh container gets a chance
-    // to clean its own orphan processing_ack rows on startup (see
-    // container/agent-runner/src/db/connection.ts). Otherwise the reset path
-    // would keep bumping process_after into the future, dueCount would stay 0,
-    // and the wake would never fire.
+    // 2. Crashed-container cleanup: processing rows left behind get retried.
+    // Ordered BEFORE the wake step so tries is incremented and process_after
+    // is set in inbound.db before the new container starts. Otherwise the
+    // new container's clearStaleProcessingAcks() races with this sweep —
+    // deleting the orphan claims first means the next sweep sees no claims,
+    // never bumps tries, and the message reprocesses immediately in a loop.
+    // resetStuckProcessingRows itself is idempotent — it skips messages
+    // already scheduled for a future retry.
+    if (!isContainerRunning(session.id) && outDb) {
+      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+    }
+
+    // 3. Wake a container if work is due and nothing is running.
+    // wakeContainer never throws — transient spawn failures (OneCLI down,
+    // etc.) return false and leave messages pending for the next tick.
     const dueCount = countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
-      // wakeContainer never throws — transient spawn failures (OneCLI down,
-      // etc.) return false and leave messages pending for the next tick.
       await wakeContainer(session);
     }
 
     const alive = isContainerRunning(session.id);
 
-    // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
+    // 4. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
       enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
-    }
-
-    // 4. Crashed-container cleanup: processing rows left behind get retried.
-    // Only fires when wake in step 2 didn't pick up the work (no due messages,
-    // or wake failed). resetStuckProcessingRows itself is idempotent — it
-    // skips messages already scheduled for a future retry.
-    if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
 
     // 5. Recurrence fanout for completed recurring tasks.
@@ -246,7 +274,7 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
+    void killContainer(session.id, 'absolute-ceiling');
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -257,7 +285,7 @@ function enforceRunningContainerSla(
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
-  killContainer(session.id, 'claim-stuck');
+  void killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 

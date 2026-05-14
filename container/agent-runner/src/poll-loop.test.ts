@@ -5,13 +5,18 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
+import { setCurrentDecision } from './routing/turn-context.js';
 
 beforeEach(() => {
   initTestSessionDb();
+  // Clear any residual turn decision left by other tests in the same process
+  // (integration.test.ts shares the runtime and sets a decision via runPollLoop).
+  setCurrentDecision(null);
 });
 
 afterEach(() => {
   closeSessionDb();
+  setCurrentDecision(null);
 });
 
 function insertMessage(
@@ -185,6 +190,30 @@ describe('on_wake filtering', () => {
       .run();
     // Should be returned even on non-first poll (on_wake=0)
     expect(getPendingMessages(false)).toHaveLength(1);
+  });
+});
+
+describe('retry budget', () => {
+  it('getPendingMessages skips rows with tries >= 5 (safety net for orphan-claim race)', () => {
+    // Defense-in-depth against the host-sweep orphan cleanup race: even if
+    // host fails to bump tries before respawn, the container refuses to pick
+    // up messages that have already exhausted their retry budget.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, tries, content)
+         VALUES ('exhausted', 'chat', datetime('now'), 'pending', 5, '{"text":"loop"}')`,
+      )
+      .run();
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, tries, content)
+         VALUES ('eligible', 'chat', datetime('now'), 'pending', 4, '{"text":"ok"}')`,
+      )
+      .run();
+
+    const ids = getPendingMessages().map((m) => m.id);
+    expect(ids).toContain('eligible');
+    expect(ids).not.toContain('exhausted');
   });
 });
 

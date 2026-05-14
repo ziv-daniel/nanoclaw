@@ -1,6 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
+import { recordModelDecision } from './db/model-decisions.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
@@ -14,7 +15,14 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { detectMediaKind } from './routing/media-detect.js';
 import { getRouter } from './routing/index.js';
+import { enforceOpusEffortCap } from './routing/opus-effort-cap.js';
+import {
+  getCurrentDecision,
+  setCurrentDecision,
+} from './routing/turn-context.js';
+import type { RouteDecision } from './routing/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -114,6 +122,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
         clearContinuation(config.providerName);
+        // No active turn decision — emit the ack without a route prefix.
+        setCurrentDecision(null);
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -170,12 +180,36 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const isTaskOrigin = keep.every(m => m.kind === 'task' || m.kind === 'webhook');
 
+    const routeMessage = keep.map(m => m.content).join(' ').slice(0, 800);
     const routeCtx = {
-      message: keep.map(m => m.content).join(' ').slice(0, 800),
-      hasAttachment: keep.some(m => /\[(image|voice|document|video|file)\s/i.test(m.content)),
+      message: routeMessage,
+      mediaKind: detectMediaKind(keep),
     };
-    const routeDecision = await getRouter().route(routeCtx);
-    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'})`);
+    const rawDecision = await getRouter().route(routeCtx);
+    // System-wide Opus effort cap. Runs after the full pipeline so it sees
+    // the final decision regardless of source (classifier, intent rule,
+    // default, inline hint). Force mode and video attachments are exempt.
+    const routeDecision = enforceOpusEffortCap(rawDecision, routeCtx.mediaKind);
+    setCurrentDecision(routeDecision);
+    log(`Route: ${routeDecision.model} / ${routeDecision.effort} (${routeDecision.rule ?? 'default'}${routeDecision.reason ? ` — ${routeDecision.reason}` : ''})`);
+
+    // Persist the decision so `get_routing_history` MCP tool can show it.
+    try {
+      recordModelDecision({
+        ts: new Date().toISOString(),
+        message_id: keep[0]?.id ?? null,
+        channel_type: routing.channelType ?? null,
+        model: routeDecision.model,
+        effort: routeDecision.effort,
+        executor: config.providerName,
+        rule: routeDecision.rule ?? 'default',
+        reason: routeDecision.reason ?? null,
+        message_excerpt: routeMessage.slice(0, 200),
+        decided_by: routeDecision.rule === 'haiku-classify' ? 'classifier' : 'rules',
+      });
+    } catch (e) {
+      log(`Failed to record model decision: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     const query = config.provider.query({
       prompt,
@@ -210,7 +244,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong.
+      // The route prefix is auto-applied by writeMessageOut from the
+      // active turn decision (see messages-out.ts).
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
@@ -220,6 +256,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
     } finally {
+      setCurrentDecision(null);
       clearCurrentInReplyTo();
     }
 
@@ -307,6 +344,24 @@ async function processQuery(
         // canonical command path + formatMessagesWithCommands.
         if (pending.some((m) => isRunnerCommand(m))) {
           log('Pending slash command — ending stream so outer loop can process');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
+
+        // Chat arriving mid-task should not inherit the task's routing
+        // decision. A scheduled task (e.g. trading screener) routes to
+        // opus-4-6/high; if the user then sends "ping" while that task
+        // is still streaming, pushing the chat in-band makes the reply
+        // run under the task's model + carry the task's [opus,high]
+        // prefix — which is honest about what ran but absurd for the
+        // content. End the stream here so the outer loop gives the chat
+        // its own routing decision (likely sonnet/low for trivial chat).
+        if (
+          isTaskOrigin &&
+          pending.some((m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && !isRunnerCommand(m))
+        ) {
+          log('Chat arrived mid-task — ending stream so outer loop can re-route');
           endedForCommand = true;
           query.end();
           return;
@@ -407,6 +462,7 @@ async function processQuery(
         // API quota exhausted — notify the user immediately so they know
         // why the agent has stopped responding.
         log('API quota exhausted — notifying user');
+        // Route prefix auto-applied by writeMessageOut from the active turn.
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -453,6 +509,8 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  *
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
+ *
+ * The route prefix is applied automatically by writeMessageOut, NOT here.
  */
 function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
@@ -514,6 +572,9 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     content: JSON.stringify({ text: body }),
   });
 }
+
+/** Re-export for tests that want to read the active turn's decision. */
+export { getCurrentDecision };
 
 /**
  * Find the thread_id and message id from the most recent inbound message

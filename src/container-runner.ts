@@ -50,7 +50,12 @@ import type { AgentGroup, Session } from './types.js';
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; startedAt: number }>();
+
+/** Wall-clock time when the container was spawned. Returns null if not running. */
+export function getContainerStartedAt(sessionId: string): number | null {
+  return activeContainers.get(sessionId)?.startedAt ?? null;
+}
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -156,7 +161,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, startedAt: Date.now() });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -174,23 +179,46 @@ async function spawnContainer(session: Session): Promise<void> {
   // (see src/host-sweep.ts). This avoids killing long-running legitimate work
   // on a wall-clock timer.
 
+  // Guarded cleanup: only clear activeContainers if it still references THIS
+  // process. killContainer may have synchronously removed the entry and a
+  // subsequent wakeContainer may already have spawned a replacement; in that
+  // case we must not clobber the new entry when the old `docker run` exits.
+  const cleanupIfOurs = (): void => {
+    const current = activeContainers.get(session.id);
+    if (current && current.process === container) {
+      activeContainers.delete(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+    }
+  };
+
   container.on('close', (code) => {
-    activeContainers.delete(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
+    cleanupIfOurs();
     log.info('Container exited', { sessionId: session.id, code, containerName });
   });
 
   container.on('error', (err) => {
-    activeContainers.delete(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
+    cleanupIfOurs();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
 
-/** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+/**
+ * Kill a container for a session. Returns when the container is gone from
+ * `activeContainers` so the next `wakeContainer` will spawn a fresh one
+ * instead of returning "already running" against the now-dying process.
+ *
+ * Callers that immediately wake the session afterwards (e.g. the approval
+ * handler for `add_mcp_server`) MUST await this OR use the `onExit` callback
+ * — otherwise the close event fires on a later event-loop tick and the wake
+ * races against stale state. Fire-and-forget callers (host-sweep) can ignore
+ * the returned promise.
+ *
+ * `onExit` fires once the underlying ChildProcess emits 'close'. It runs at
+ * roughly the same point that the returned promise resolves; pick whichever
+ * style fits the caller.
+ */
+export async function killContainer(sessionId: string, reason: string, onExit?: () => void): Promise<void> {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
@@ -199,11 +227,32 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+
+  // Drop from the active map up-front so a wakeContainer that runs in the
+  // same async tick (post-await) sees the slot as free. The 'close' handler
+  // is guarded by a process-identity check, so a later replacement entry
+  // won't be clobbered when this docker-run exits.
+  activeContainers.delete(sessionId);
+  markContainerStopped(sessionId);
+  stopTypingRefresh(sessionId);
+
+  // Wait for the underlying ChildProcess to actually exit. Capped so a
+  // wedged docker run can't keep the approval flow hanging indefinitely.
+  const exitPromise: Promise<void> =
+    entry.process.exitCode !== null
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          entry.process.once('close', () => resolve());
+          entry.process.once('error', () => resolve());
+        });
+
   try {
     stopContainer(entry.containerName);
   } catch {
     entry.process.kill('SIGKILL');
   }
+
+  await Promise.race([exitPromise, new Promise<void>((resolve) => setTimeout(resolve, 5000))]);
 }
 
 /**

@@ -222,6 +222,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
+        log.info('bridge.onSubscribedMessage', {
+          adapter: adapter.name,
+          channelId,
+          threadId: thread.id,
+          textLen: (message.text ?? '').length,
+          attachmentCount: message.attachments?.length ?? 0,
+        });
         await setupConfig.onInbound(
           channelId,
           thread.id,
@@ -232,6 +239,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
+        log.info('bridge.onNewMention', {
+          adapter: adapter.name,
+          channelId,
+          threadId: thread.id,
+          textLen: (message.text ?? '').length,
+          attachmentCount: message.attachments?.length ?? 0,
+        });
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
       });
 
@@ -246,6 +260,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           channelId,
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
+          textLen: (message.text ?? '').length,
+          attachmentCount: message.attachments?.length ?? 0,
         });
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, false));
       });
@@ -262,6 +278,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flood gate.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
+        log.info('bridge.onNewMessage', {
+          adapter: adapter.name,
+          channelId,
+          threadId: thread.id,
+          textLen: (message.text ?? '').length,
+          attachmentCount: message.attachments?.length ?? 0,
+        });
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
       });
 
@@ -284,7 +307,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const matched = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matched?.selectedLabel ?? selectedOption ?? '(clicked)';
 
-        // Update the card to show the selected answer and remove buttons
+        // Dispatch to the host immediately so approval handlers (kill +
+        // respawn for add_mcp_server, etc.) start running while the card
+        // edit is in flight. Edit + dispatch were sequential previously,
+        // which made the button feel stuck on slow editMessage round-trips
+        // and also delayed the approval applying.
+        setupConfig.onAction(questionId, selectedOption, userId);
+
+        // Update the card to show the selected answer and remove buttons.
+        // Best-effort — failure is logged but doesn't block the dispatch.
         try {
           const tid = event.threadId;
           await adapter.editMessage(tid, event.messageId, {
@@ -293,8 +324,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
-
-        setupConfig.onAction(questionId, selectedOption, userId);
       });
 
       await chat.initialize();

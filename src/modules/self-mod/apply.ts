@@ -10,10 +10,9 @@
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
  */
-import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
+import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { getSession } from '../../db/sessions.js';
 import type { McpServerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -55,6 +54,9 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
   log.info('Package install approved', { agentGroupId: session.agent_group_id, userId });
   try {
     await buildAgentGroupImage(session.agent_group_id);
+    // Write the on_wake message BEFORE killing so the fresh container picks
+    // it up on its first poll. on_wake=1 ensures the dying container can't
+    // steal it during its SIGTERM grace period.
     writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
@@ -69,10 +71,10 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
       }),
       onWake: 1,
     });
-    killContainer(session.id, 'rebuild applied', () => {
-      const s = getSession(session.id);
-      if (s) wakeContainer(s);
-    });
+    // Await the kill so the activeContainers slot is free before the response
+    // handler's follow-up `wakeContainer(session)` runs — otherwise it sees the
+    // dying container as still running and skips the spawn.
+    await killContainer(session.id, 'rebuild applied');
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
     notify(
@@ -95,7 +97,8 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     return;
   }
 
-  // Add the new MCP server to the existing map in the DB
+  // Persist the new MCP server in the DB (source of truth — will be
+  // materialized into container.json at the next spawn).
   const servers = JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>;
   servers[payload.name as string] = {
     command: payload.command as string,
@@ -104,6 +107,9 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
   };
   updateContainerConfigJson(agentGroup.id, 'mcp_servers', servers);
 
+  // Write the on_wake message BEFORE killing so the fresh container picks it
+  // up on its first poll. on_wake=1 prevents the dying container from stealing
+  // it during its SIGTERM grace period.
   writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
@@ -118,9 +124,11 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     }),
     onWake: 1,
   });
-  killContainer(session.id, 'mcp server added', () => {
-    const s = getSession(session.id);
-    if (s) wakeContainer(s);
-  });
+  // Await the kill so the activeContainers slot is free before the response
+  // handler's follow-up `wakeContainer(session)` runs — otherwise it sees the
+  // dying container as still running and skips the spawn, leaving the new
+  // MCP server unloaded until the next host-sweep tick (~60s).
+  await killContainer(session.id, 'mcp server added');
+  notify(`MCP server "${payload.name}" added. Your container is restarting with it now.`);
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id, userId });
 };

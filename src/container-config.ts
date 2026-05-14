@@ -7,6 +7,12 @@
  *   - `materializeContainerJson()` — writes `groups/<folder>/container.json`
  *     from the DB at spawn time
  *   - `configFromDb()` — builds a `ContainerConfig` from a DB row + agent group
+ *
+ * Global MCP servers: any MCP servers defined in `groups/_global/container.json`
+ * are merged into every group's materialized config automatically. Group-level
+ * entries override global ones when the key matches. This is a file-based
+ * escape hatch that survives the DB migration — see the note in
+ * `mergeGlobalMcpServers` below.
  */
 import fs from 'fs';
 import path from 'path';
@@ -45,6 +51,8 @@ export interface ContainerConfig {
   effort?: string;
 }
 
+const GLOBAL_FOLDER = '_global';
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
@@ -67,6 +75,23 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
 }
 
 /**
+ * Read MCP servers from `groups/_global/container.json` (file-based escape
+ * hatch from the pre-DB era). Returns `{}` if missing or malformed — never
+ * throws. Group-level entries take precedence on key collision.
+ */
+function readGlobalMcpServers(): Record<string, McpServerConfig> {
+  const p = path.join(GROUPS_DIR, GLOBAL_FOLDER, 'container.json');
+  if (!fs.existsSync(p)) return {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
+    return raw.mcpServers ?? {};
+  } catch (err) {
+    console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
+    return {};
+  }
+}
+
+/**
  * Materialize `container.json` from the DB. Called at spawn time so the
  * container always sees fresh config. Returns the `ContainerConfig` for
  * use by the caller (buildMounts, buildContainerArgs, etc.).
@@ -78,7 +103,14 @@ export function materializeContainerJson(agentGroupId: string): ContainerConfig 
   const row = getContainerConfig(agentGroupId);
   if (!row) throw new Error(`Container config not found for agent group: ${agentGroupId}`);
 
-  const config = configFromDb(row, group);
+  const base = configFromDb(row, group);
+
+  // Merge in global MCP servers (group-level wins on collision). Skip for
+  // the global folder itself so it doesn't try to merge with its own file.
+  const config: ContainerConfig =
+    group.folder === GLOBAL_FOLDER
+      ? base
+      : { ...base, mcpServers: { ...readGlobalMcpServers(), ...base.mcpServers } };
 
   const p = path.join(GROUPS_DIR, group.folder, 'container.json');
   const dir = path.dirname(p);

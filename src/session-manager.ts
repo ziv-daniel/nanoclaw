@@ -140,6 +140,11 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 
   ensureSchema(inboundDbPath(agentGroupId, sessionId), 'inbound');
   ensureSchema(outboundDbPath(agentGroupId, sessionId), 'outbound');
+
+  fs.chownSync(dir, 1000, 1000);
+  fs.chownSync(path.join(dir, 'outbox'), 1000, 1000);
+  fs.chownSync(inboundDbPath(agentGroupId, sessionId), 1000, 1000);
+  fs.chownSync(outboundDbPath(agentGroupId, sessionId), 1000, 1000);
 }
 
 /**
