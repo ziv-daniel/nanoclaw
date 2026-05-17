@@ -1,0 +1,29 @@
+services:
+  mcp-gateway:
+    build: .
+    container_name: mcp-gateway
+    image: mcp-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "3001:3001"   # github
+      - "3002:3002"   # n8n-mcp
+      - "3004:3004"   # dokploy
+      - "3005:3005"   # hass-mcp (3003 was occupied on this host)
+      # port 3000 (health) is internal-only — no host mapping needed
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - N8N_API_URL=${N8N_API_URL}
+      - N8N_API_KEY=${N8N_API_KEY}
+      - HA_URL=${HA_URL}
+      - HA_TOKEN=${HA_TOKEN}
+      - DOKPLOY_URL=${DOKPLOY_URL}
+      - DOKPLOY_API_KEY=${DOKPLOY_API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
