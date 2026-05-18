@@ -328,7 +328,19 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
+          const sdkMsg = message as {
+            modelUsage?: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
+          };
+          const usage = sdkMsg.modelUsage
+            ? Object.entries(sdkMsg.modelUsage).map(([model, u]) => ({
+                model,
+                input_tokens: u.inputTokens,
+                output_tokens: u.outputTokens,
+                cache_create_tokens: u.cacheCreationInputTokens,
+                cache_read_tokens: u.cacheReadInputTokens,
+              }))
+            : undefined;
+          yield { type: 'result', text, usage };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
