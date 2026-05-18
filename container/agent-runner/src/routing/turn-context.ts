@@ -1,3 +1,4 @@
+import fs from 'fs';
 import type { EffortLevel, ModelId, RouteDecision } from './types.js';
 
 /**
@@ -8,14 +9,23 @@ import type { EffortLevel, ModelId, RouteDecision } from './types.js';
  * (`send_message`, `send_file`, `edit_message`, `ask_user_question`,
  * `send_card`) which would otherwise bypass the prefix.
  *
- * The poll-loop is single-threaded (one `processQuery` at a time per
- * container), so a plain module variable is sufficient — no
- * AsyncLocalStorage needed.
+ * The poll-loop process sets the module variable directly. MCP tool
+ * subprocesses can't see it (separate V8 isolate), so the decision is
+ * also persisted to a file that `formatRoutePrefix` reads as fallback.
  */
 let currentDecision: RouteDecision | null = null;
 
+const ROUTE_DECISION_PATH = '/workspace/.route-decision.json';
+
 export function setCurrentDecision(d: RouteDecision | null): void {
   currentDecision = d;
+  try {
+    if (d) {
+      fs.writeFileSync(ROUTE_DECISION_PATH, JSON.stringify(d));
+    } else {
+      fs.unlinkSync(ROUTE_DECISION_PATH);
+    }
+  } catch { /* ignore — file ops are best-effort */ }
 }
 
 export function getCurrentDecision(): RouteDecision | null {
@@ -32,10 +42,19 @@ export function shortModelLabel(model: ModelId | string): string {
 /**
  * Format the route prefix that gets prepended to outbound chat text.
  * Example: `[opus,high]\n`. Returns null when no decision is active.
+ *
+ * Falls back to the shared file when the module variable is null —
+ * this is the normal path for MCP tool subprocesses.
  */
 export function formatRoutePrefix(d: RouteDecision | null = currentDecision): string | null {
-  if (!d) return null;
-  return `[${shortModelLabel(d.model)},${d.effort}]\n`;
+  let decision = d;
+  if (!decision) {
+    try {
+      decision = JSON.parse(fs.readFileSync(ROUTE_DECISION_PATH, 'utf-8'));
+    } catch { /* no file or parse error — no prefix */ }
+  }
+  if (!decision) return null;
+  return `[${shortModelLabel(decision.model)},${decision.effort}]\n`;
 }
 
 /**
