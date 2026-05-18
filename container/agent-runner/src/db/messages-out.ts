@@ -7,6 +7,8 @@
 import { formatRoutePrefix, hasRoutePrefix } from '../routing/turn-context.js';
 import { getInboundDb, getOutboundDb } from './connection.js';
 
+const ROUTE_PREFIX_RE = /^\[(opus|sonnet|haiku)[\w-]*,(low|medium|high|xhigh)\]\n/;
+
 export interface MessageOutRow {
   id: string;
   seq: number | null;
@@ -186,6 +188,40 @@ export function getRoutingBySeq(
     .prepare('SELECT channel_type, platform_id, thread_id FROM messages_out WHERE seq = ?')
     .get(seq) as { channel_type: string | null; platform_id: string | null; thread_id: string | null } | undefined;
   return outRow ?? null;
+}
+
+/**
+ * Check if a message with the same text was already written to outbound
+ * for the same platform_id within the last 30 seconds. Used to suppress
+ * duplicates when the agent emits the same content via both an MCP tool
+ * (send_message) and a <message> block in its result text.
+ *
+ * Comparison strips the `[model,effort]` route prefix so that a prefixed
+ * copy and a raw copy of the same text are recognized as duplicates.
+ */
+export function isDuplicateMessage(rawText: string, platformId: string): boolean {
+  const rows = getOutboundDb()
+    .prepare(
+      `SELECT content FROM messages_out
+       WHERE platform_id = ?
+         AND timestamp > datetime('now', '-30 seconds')
+       ORDER BY seq DESC LIMIT 10`,
+    )
+    .all(platformId) as Array<{ content: string }>;
+
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.content);
+      const existing = typeof parsed.text === 'string' ? parsed.text : null;
+      if (existing) {
+        const stripped = existing.replace(ROUTE_PREFIX_RE, '');
+        if (stripped === rawText) return true;
+      }
+    } catch {
+      /* not JSON — skip */
+    }
+  }
+  return false;
 }
 
 /** Get undelivered messages (for host polling — reads from outbound.db). */
