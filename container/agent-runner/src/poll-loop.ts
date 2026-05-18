@@ -2,6 +2,7 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { recordModelDecision } from './db/model-decisions.js';
+import { recordUsage } from './db/agent-usage.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
@@ -444,6 +445,12 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        if (event.usage) {
+          const ts = new Date().toISOString();
+          for (const u of event.usage) {
+            recordUsage({ ts, session_id: queryContinuation ?? null, model: u.model, input_tokens: u.input_tokens, output_tokens: u.output_tokens, cache_create_tokens: u.cache_create_tokens, cache_read_tokens: u.cache_read_tokens });
+          }
+        }
         if (event.text) {
           const { hasUnwrapped } = dispatchResultText(event.text, routing);
           if (hasUnwrapped && !unwrappedNudged) {
