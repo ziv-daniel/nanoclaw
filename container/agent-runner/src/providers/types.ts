@@ -84,7 +84,7 @@ export interface AgentQuery {
 
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
-  | { type: 'result'; text: string | null }
+  | { type: 'result'; text: string | null; usage?: Array<{ model: string; input_tokens: number; output_tokens: number; cache_create_tokens: number; cache_read_tokens: number }> }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**
